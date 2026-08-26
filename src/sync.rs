@@ -12,14 +12,6 @@ use crate::github::GitHub;
 use crate::snapshot::Snapshot;
 use crate::store::Store;
 
-/// Progress reported while a refresh runs, so the UI can stay responsive and say what it is doing.
-#[derive(Debug, Clone)]
-pub enum Progress {
-    Stage(String),
-    Done(String),
-    Failed(String),
-}
-
 /// Build a snapshot from cache without any network access.
 ///
 /// `None` when this repo has never been synced.

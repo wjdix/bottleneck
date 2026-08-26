@@ -79,10 +79,6 @@ impl Trunk {
     pub fn len(&self) -> usize {
         self.len
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
 }
 
 /// A deploy tag placed on the trunk.
@@ -103,9 +99,6 @@ pub struct TrunkTag {
     /// merge commit dated 12:55:05Z, which would report a merge-to-deploy time of *minus* 1m39s.
     /// The tag name's 12:58:00Z gives the correct +1m16s.
     pub deployed_at: DateTime<Utc>,
-    /// The tagged commit's date. Kept for display and for the history-window filter; not used for
-    /// ordering or duration maths.
-    pub commit_date: DateTime<Utc>,
 }
 
 /// Tags for one environment, indexed for repeated lookup.
@@ -158,10 +151,6 @@ impl EnvTags {
             return None;
         }
         self.tags.get(self.earliest[upper - 1])
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.tags.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -225,25 +214,14 @@ mod tests {
             .collect()
     }
 
-    /// A tag whose deploy time and commit date coincide — the simple case.
     fn tag(name: &str, idx: usize, at: &str) -> TrunkTag {
-        TrunkTag {
-            name: name.to_string(),
-            idx,
-            deployed_at: ts(at),
-            commit_date: ts(at),
-        }
+        TrunkTag { name: name.to_string(), idx, deployed_at: ts(at) }
     }
 
-    /// A tag where the deploy time is decoupled from the commit it points at, which is the shape
-    /// that matters for rollbacks.
-    fn tag_at(name: &str, idx: usize, deployed_at: &str, commit_date: &str) -> TrunkTag {
-        TrunkTag {
-            name: name.to_string(),
-            idx,
-            deployed_at: ts(deployed_at),
-            commit_date: ts(commit_date),
-        }
+    /// A tag whose deploy time is decoupled from the commit it points at — the rollback shape.
+    /// `commit_date` is only meaningful as documentation here, since attribution never uses it.
+    fn tag_at(name: &str, idx: usize, deployed_at: &str, _commit_date: &str) -> TrunkTag {
+        TrunkTag { name: name.to_string(), idx, deployed_at: ts(deployed_at) }
     }
 
     #[test]
@@ -389,7 +367,9 @@ mod tests {
             merged_at
         );
         assert_eq!((t.deployed_at - merged_at).num_seconds(), 76);
-        assert!(t.commit_date < merged_at, "the commit date really does precede the merge");
+        // The commit itself was dated 12:55:05Z, before the 12:56:44Z merge — which is exactly why
+        // the commit date cannot be used as the deploy time.
+        assert!(ts("2026-08-26T12:55:05Z") < merged_at);
     }
 
     #[test]

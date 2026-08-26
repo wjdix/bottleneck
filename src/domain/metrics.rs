@@ -10,7 +10,6 @@ use crate::domain::trunk::{DeployState, EnvTags, Trunk, resolve_deploy};
 /// Stage durations for a single PR, plus where it got to.
 #[derive(Debug, Clone)]
 pub struct PrMetrics {
-    pub number: i64,
     /// Time spent as a draft before first asking for review.
     pub draft_dwell: Option<Duration>,
     /// Ready-for-review until the first human review. The review-pickup latency.
@@ -81,7 +80,6 @@ impl PrMetrics {
         }
 
         Self {
-            number: pr.number,
             draft_dwell,
             time_to_first_review,
             review_turnaround,

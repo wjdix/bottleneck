@@ -104,7 +104,6 @@ impl Snapshot {
                             name: tag.name,
                             idx,
                             deployed_at: tag.parsed.name_ts,
-                            commit_date: tag.commit_date,
                         });
                     }
                     // Not on the first-parent line: a branch deploy, or a commit older than the
@@ -212,5 +211,119 @@ impl Snapshot {
             self.prs.iter().filter(|p| p.is_awaiting_review()).collect();
         out.sort_by_key(|p| p.ready_at.unwrap_or(p.created_at));
         out
+    }
+}
+
+/// Fixtures shared by UI and metrics tests.
+#[cfg(test)]
+pub mod fixtures {
+    use super::*;
+    use crate::domain::deploy::parse_tag;
+    use crate::domain::pr::{PrState, Review};
+    use crate::github::fetch::Commit;
+
+    pub fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    pub fn repo() -> RepoConfig {
+        RepoConfig {
+            owner: "pagos-ai".into(),
+            name: "pagos".into(),
+            default_branch: "main".into(),
+        }
+    }
+
+    fn pr(
+        number: i64,
+        author: &str,
+        state: PrState,
+        is_draft: bool,
+        created: &str,
+        merged: Option<&str>,
+        oid: Option<&str>,
+        base: &str,
+    ) -> PullRequest {
+        PullRequest {
+            number,
+            title: format!("ENG-{number}: a change with a reasonably long title to exercise truncation"),
+            author: author.into(),
+            state,
+            is_draft,
+            base_ref: base.into(),
+            head_ref: format!("eng-{number}"),
+            created_at: ts(created),
+            updated_at: ts(merged.unwrap_or(created)),
+            ready_at: (!is_draft).then(|| ts(created)),
+            merged_at: merged.map(ts),
+            closed_at: merged.map(ts),
+            merge_commit_oid: oid.map(Into::into),
+            first_review_at: Some(ts("2026-08-26T11:54:14Z")),
+            approved_at: Some(ts("2026-08-26T11:54:36Z")),
+            first_review_requested_at: Some(ts("2026-08-26T11:39:26Z")),
+            reviews: vec![Review {
+                author: "alexlobanov".into(),
+                state: "APPROVED".into(),
+                submitted_at: ts("2026-08-26T11:54:36Z"),
+            }],
+            labels: vec!["type:feature".into()],
+            additions: 120,
+            deletions: 30,
+            changed_files: 4,
+            truncated: false,
+        }
+    }
+
+    /// A snapshot covering every interesting case: merged-and-deployed, merged-and-pending,
+    /// an open PR with no review, a draft, and a stacked PR.
+    pub fn snapshot() -> Snapshot {
+        let history = HistoryScan {
+            head: "aaa".into(),
+            pages: 1,
+            commits: vec![
+                Commit { oid: "aaa".into(), committed_date: ts("2026-08-26T12:55:05Z"), first_parent: Some("bbb".into()), parent_count: 1 },
+                Commit { oid: "bbb".into(), committed_date: ts("2026-08-26T10:00:00Z"), first_parent: None, parent_count: 1 },
+            ],
+        };
+
+        let mut tags = BTreeMap::new();
+        let name = "release/prod/20260826_125800";
+        tags.insert("prod".to_string(), vec![DeployTag {
+            name: name.into(),
+            parsed: parse_tag(name).unwrap(),
+            commit_oid: "bbb".into(),
+            commit_date: ts("2026-08-26T10:00:00Z"),
+        }]);
+        // A dev tag pointing off-trunk, so coverage reports as partial like the real repo.
+        let dev = "release/dev/20260826_134906";
+        tags.insert("dev".to_string(), vec![DeployTag {
+            name: dev.into(),
+            parsed: parse_tag(dev).unwrap(),
+            commit_oid: "not-on-trunk".into(),
+            commit_date: ts("2026-08-26T13:30:00Z"),
+        }]);
+
+        let prs = vec![
+            pr(2102, "altaired", PrState::Merged, false, "2026-08-26T09:00:00Z", Some("2026-08-26T09:30:00Z"), Some("bbb"), "main"),
+            pr(2101, "d-avko", PrState::Merged, false, "2026-08-20T09:00:00Z", Some("2026-08-26T12:56:44Z"), Some("aaa"), "main"),
+            pr(2100, "wjdix", PrState::Open, false, "2026-06-01T09:00:00Z", None, None, "main"),
+            pr(2099, "alexlobanov", PrState::Open, true, "2026-08-25T09:00:00Z", None, None, "main"),
+            pr(2098, "juloi", PrState::Merged, false, "2026-08-24T09:00:00Z", Some("2026-08-25T09:00:00Z"), Some("off"), "eng-7312"),
+        ];
+        // The open PR has no review at all, which is what the stuck list is for.
+        let mut prs = prs;
+        prs[2].reviews.clear();
+        prs[2].first_review_at = None;
+        prs[2].approved_at = None;
+
+        Snapshot::build(
+            &repo(),
+            &Config::default(),
+            &history,
+            tags,
+            vec!["release/dev/parrot-test-20260605_161016".into()],
+            prs,
+            ts("2026-08-26T15:00:00Z"),
+        )
     }
 }

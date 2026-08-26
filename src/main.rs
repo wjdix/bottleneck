@@ -6,8 +6,9 @@ mod github;
 mod snapshot;
 mod store;
 mod sync;
+mod ui;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 
 use config::Config;
@@ -33,6 +34,24 @@ struct Args {
     #[arg(long)]
     dump_deploys: bool,
 
+    /// Fetch from GitHub and update the cache, without starting the TUI.
+    #[arg(long)]
+    sync: bool,
+
+    /// Render a tab to stdout from the cache and exit, without a terminal.
+    ///
+    /// Lets the real cached data be inspected in CI or a pipe, where no TTY exists.
+    #[arg(long, value_name = "TAB")]
+    render: Option<String>,
+
+    /// Terminal size for --render, as WIDTHxHEIGHT.
+    #[arg(long, default_value = "170x44")]
+    size: String,
+
+    /// Deploy environment for --render.
+    #[arg(long)]
+    env: Option<String>,
+
     /// Override the history window, in days.
     #[arg(long)]
     days: Option<i64>,
@@ -56,7 +75,82 @@ async fn main() -> Result<()> {
         return dump_deploys(&cfg).await;
     }
 
-    println!("TUI not implemented yet — try --dump-tags");
+    let db = config::db_path()?;
+    let mut store = store::Store::open(&db)?;
+    let repo = cfg
+        .repos
+        .first()
+        .cloned()
+        .context("no repositories configured")?;
+
+    if args.sync {
+        let gh = GitHub::new(GitHub::resolve_token().await?)?;
+        let snap = sync::refresh(&gh, &mut store, &repo, &cfg, |stage| {
+            eprintln!("  {stage}...");
+        })
+        .await?;
+        eprintln!(
+            "synced {} PRs and {} trunk commits to {}",
+            snap.prs.len(),
+            snap.trunk.len(),
+            db.display()
+        );
+        return Ok(());
+    }
+
+    // Launch reads the cache only. Nothing here touches the network: a first run shows an empty
+    // state telling the user to press r, rather than blocking on a fetch they did not ask for.
+    let snapshot = sync::load_cached(&store, &repo, &cfg)?;
+
+    if let Some(tab) = args.render.as_deref() {
+        return render_once(cfg, snapshot, tab, &args.size, args.env.as_deref());
+    }
+
+    ui::run::run(cfg, store, snapshot).await
+}
+
+/// Draw one tab into an in-memory terminal and print it, so cached data can be checked without a
+/// TTY.
+fn render_once(
+    cfg: Config,
+    snapshot: Option<Snapshot>,
+    tab: &str,
+    size: &str,
+    env: Option<&str>,
+) -> Result<()> {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ui::app::{App, Tab};
+
+    let (w, h) = size
+        .split_once('x')
+        .and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)))
+        .with_context(|| format!("--size must look like 170x44, got {size:?}"))?;
+
+    let selected = Tab::ALL
+        .iter()
+        .find(|t| t.title().eq_ignore_ascii_case(tab))
+        .copied()
+        .with_context(|| {
+            let names: Vec<&str> = Tab::ALL.iter().map(|t| t.title()).collect();
+            format!("unknown tab {tab:?}; expected one of {}", names.join(", "))
+        })?;
+
+    let mut app = App::new(cfg, snapshot);
+    app.tab = selected;
+    if let Some(env) = env {
+        app.env = env.to_string();
+    }
+
+    let mut terminal = Terminal::new(TestBackend::new(w, h))?;
+    terminal.draw(|f| ui::views::draw(f, &app))?;
+    let buf = terminal.backend().buffer().clone();
+    for y in 0..buf.area.height {
+        let line: String = (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect();
+        println!("{}", line.trim_end());
+    }
     Ok(())
 }
 

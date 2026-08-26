@@ -11,14 +11,14 @@ malformed tags are skipped, not fatal.
 **Tests**: tag parsing over the real malformed names found in `pagos-ai/pagos`
 (`release/qa/20251215_13235`, `release/dec`, `release/ops/test-ghas-20260417`,
 `release/alerts-mlade-images/qa/...`).
-**Status**: In Progress
+**Status**: Complete
 
 ## Stage 2: Store + full sync
 **Goal**: SQLite schema and a full 90-day sync of PRs, deploy tags, and `main` history w/ parents.
 **Success Criteria**: after `bottleneck --sync`, the DB holds ~90 days of PRs, all in-window
 release tags, and a commit row per ancestor; re-running is idempotent.
 **Tests**: schema migration from empty; upsert idempotency.
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 3: Metrics
 **Goal**: First-parent trunk reconstruction, per-env deploy mapping, PR timeline normalization,
@@ -27,14 +27,14 @@ percentile aggregation.
 `release/prod/20260826_125800`; stacked PRs report `Stacked`.
 **Tests**: squash chain; monorepo-import merge whose 2nd parent has older dates; rollback tag;
 stacked PR off-trunk; merged-but-undeployed.
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 4: TUI
 **Goal**: Pipeline / Review / People / PRs tabs over cached data, refresh on `r`.
 **Success Criteria**: cold launch syncs with progress; relaunch is instant; People tab totals
 match GitHub (85 open / 51 draft).
 **Tests**: duration formatting; narrow-terminal layout doesn't panic.
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 5: Polish
 **Goal**: Incremental sync, multi-repo picker, window extension, review/timeline backfill.

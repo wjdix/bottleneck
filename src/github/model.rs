@@ -2,6 +2,12 @@
 //!
 //! These stay close to the wire format; normalization into domain types happens in `crate::domain`.
 
+// These types are a mirror of the GraphQL schema, so some fields exist to document and validate the
+// response shape rather than because every one is read today (`rateLimit`, `totalCount` on
+// connections we do not paginate). Keeping them means a query change shows up as a deserialization
+// error here rather than as a silently missing value downstream.
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
