@@ -173,7 +173,10 @@ pub struct PullRequestNode {
     pub merge_commit: Option<CommitRef>,
     pub labels: Option<LabelConnection>,
     pub reviews: Option<ReviewConnection>,
-    pub timeline_items: Option<TimelineConnection>,
+    /// Tail of the filtered timeline — holds the most recent ready-for-review transition.
+    pub latest: Option<TimelineConnection>,
+    /// Head of the review-request timeline — holds the first review request.
+    pub earliest: Option<TimelineConnection>,
 }
 
 /// A PR/review author. `__typename` distinguishes `Bot` from `User`, which is how bot reviews get
@@ -205,6 +208,7 @@ pub struct Label {
 #[serde(rename_all = "camelCase")]
 pub struct ReviewConnection {
     pub total_count: u32,
+    pub page_info: PageInfo,
     pub nodes: Vec<ReviewNode>,
 }
 
@@ -219,7 +223,11 @@ pub struct ReviewNode {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimelineConnection {
-    pub total_count: u32,
+    // `totalCount` is deliberately NOT selected or stored. On a filtered timeline it ignores
+    // `itemTypes` and counts the entire timeline, so comparing it against `nodes.len()` reports
+    // every PR as truncated — PR #2102 returns 9 matching events with a totalCount of 37.
+    // `has_next_page` is the only sound truncation signal here.
+    pub page_info: PageInfo,
     pub nodes: Vec<TimelineItem>,
 }
 
@@ -231,29 +239,7 @@ pub enum TimelineItem {
     #[serde(rename_all = "camelCase")]
     ConvertToDraftEvent { created_at: DateTime<Utc> },
     #[serde(rename_all = "camelCase")]
-    ReviewRequestedEvent {
-        created_at: DateTime<Utc>,
-        requested_reviewer: Option<RequestedReviewer>,
-    },
+    ReviewRequestedEvent { created_at: DateTime<Utc> },
     #[serde(other)]
     Other,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "__typename")]
-pub enum RequestedReviewer {
-    User { login: String },
-    Team { name: String },
-    #[serde(other)]
-    Other,
-}
-
-impl RequestedReviewer {
-    pub fn label(&self) -> Option<&str> {
-        match self {
-            RequestedReviewer::User { login } => Some(login),
-            RequestedReviewer::Team { name } => Some(name),
-            RequestedReviewer::Other => None,
-        }
-    }
 }

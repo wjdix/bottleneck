@@ -5,7 +5,6 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 use crate::config::{Config, RepoConfig};
@@ -14,7 +13,7 @@ use crate::domain::metrics::{
 };
 use crate::domain::pr::PullRequest;
 use crate::domain::trunk::{EnvTags, Trunk, TrunkTag};
-use crate::github::fetch::{self, DeployTag, HistoryScan};
+use crate::github::fetch::{DeployTag, HistoryScan};
 
 pub struct Snapshot {
     pub repo: RepoConfig,
@@ -126,7 +125,7 @@ impl Snapshot {
             synced_at: now,
             window_start: cfg.window_start(),
             aggregates: aggregate(&metrics, &envs),
-            people: person_loads(&prs, now),
+            people: person_loads(&prs, cfg, now),
             reviewers: reviewer_loads(&prs),
             prs,
             metrics,
@@ -136,56 +135,6 @@ impl Snapshot {
             skipped_tags,
             coverage,
         }
-    }
-
-    /// Fetch everything for one repo and analyse it.
-    pub async fn fetch(
-        gh: &crate::github::GitHub,
-        repo: &RepoConfig,
-        cfg: &Config,
-        mut progress: impl FnMut(&str),
-    ) -> Result<Self> {
-        let since = cfg.window_start();
-
-        progress("history");
-        let history = fetch::fetch_history(gh, repo, since).await?;
-
-        let mut tags_by_env = BTreeMap::new();
-        let mut skipped = Vec::new();
-        for env in &cfg.envs {
-            progress(&format!("tags: {env}"));
-            let scan = fetch::fetch_tags(gh, repo, env, since).await?;
-            skipped.extend(scan.unparseable);
-            tags_by_env.insert(env.clone(), scan.tags);
-        }
-
-        // Two passes, because the window means different things for open and closed PRs. Closed and
-        // merged PRs are bounded by the window so latency stats describe recent behaviour. Open PRs
-        // are fetched in full: `pagos-ai/pagos` has 7 open PRs untouched for more than 90 days, up
-        // to nine months, and those are the most stuck threads in the repo — windowing them out
-        // would hide exactly what this tool is for.
-        progress("pull requests (window)");
-        let mut nodes =
-            fetch::fetch_pull_requests(gh, repo, &["CLOSED", "MERGED"], Some(since), |_| {}).await?;
-
-        progress("pull requests (all open)");
-        let open = fetch::fetch_pull_requests(gh, repo, &["OPEN"], None, |_| {}).await?;
-
-        let mut seen: std::collections::HashSet<i64> = nodes.iter().map(|n| n.number).collect();
-        for node in open {
-            if seen.insert(node.number) {
-                nodes.push(node);
-            }
-        }
-
-        let prs: Vec<PullRequest> = nodes
-            .iter()
-            .map(|n| PullRequest::from_node(n, cfg))
-            .collect();
-
-        Ok(Self::build(
-            repo, cfg, &history, tags_by_env, skipped, prs, Utc::now(),
-        ))
     }
 
     /// PRs merged but not yet in any deploy for `env`, oldest merge first — the stuck list.

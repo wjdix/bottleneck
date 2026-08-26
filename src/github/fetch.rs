@@ -125,10 +125,15 @@ const MAX_HISTORY_PAGES: usize = 500;
 ///
 /// In practice this is cheap: for a 90-day window on `pagos-ai/pagos`, all-ancestors in range is 774
 /// commits against 765 on the trunk, so it settles in ~8 pages.
+///
+/// `known` lets an incremental refresh stop as soon as it reaches a commit already cached: the
+/// first-parent chain is then guaranteed to join up with the cached trunk, so the union covers the
+/// window without refetching it.
 pub async fn fetch_history(
     gh: &GitHub,
     repo: &RepoConfig,
     since: DateTime<Utc>,
+    known: &std::collections::HashSet<String>,
 ) -> Result<HistoryScan> {
     let branch = format!("refs/heads/{}", repo.default_branch);
     let mut commits: Vec<Commit> = Vec::new();
@@ -158,9 +163,13 @@ pub async fn fetch_history(
             .with_context(|| format!("branch {branch} not found in {}", repo.slug()))?;
         pages += 1;
 
+        let mut reached_known = false;
         for node in history.nodes {
             if head.is_none() {
                 head = Some(node.oid.clone());
+            }
+            if known.contains(&node.oid) {
+                reached_known = true;
             }
             let first_parent = node.parents.nodes.first().map(|p| p.oid.clone());
             dates.insert(node.oid.clone(), node.committed_date);
@@ -177,6 +186,10 @@ pub async fn fetch_history(
             break; // empty branch
         };
 
+        // Joining the cached history is enough; the caller merges the two sets.
+        if reached_known {
+            break;
+        }
         if trunk_reaches_back_to(head_oid, &parents, &dates, since) {
             break;
         }

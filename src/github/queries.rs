@@ -57,8 +57,10 @@ query($owner: String!, $name: String!, $branch: String!, $cursor: String) {
 
 /// Pull requests, newest-updated first, with everything the metrics need in one pass.
 ///
-/// `reviews`/`timelineItems` page sizes can truncate on unusually busy PRs; `totalCount` is
-/// selected so the sync can detect that and backfill rather than silently using partial data.
+/// Truncation of `reviews`/`timelineItems` is detected via `pageInfo.hasNextPage`, NOT `totalCount`.
+/// `timelineItems.totalCount` ignores the `itemTypes` filter and reports the whole timeline: PR
+/// #2102 returns 9 matching events but a totalCount of 37, identical to its unfiltered total. A
+/// totalCount comparison therefore flags every PR as truncated.
 ///
 /// `states` is a parameter because open PRs must be fetched without a time cutoff: an open PR
 /// untouched for nine months is exactly the stuck thread this tool exists to surface, and a
@@ -89,22 +91,28 @@ query($owner: String!, $name: String!, $states: [PullRequestState!]!, $cursor: S
         labels(first: 20) { nodes { name } }
         reviews(first: 50) {
           totalCount
+          pageInfo { hasNextPage }
           nodes { state submittedAt author { __typename login } }
         }
-        timelineItems(first: 100, itemTypes: [READY_FOR_REVIEW_EVENT, CONVERT_TO_DRAFT_EVENT, REVIEW_REQUESTED_EVENT]) {
-          totalCount
+        # Two windows onto the same filtered timeline, because it is returned oldest-first and the
+        # two timestamps we need sit at opposite ends. `latest` (last: 100) carries the most recent
+        # ready-for-review transition, which is what review latency is measured from; `earliest`
+        # (first: 100) carries the first review request. Taking only one end would silently lose the
+        # other on a long-lived PR. Both aliases still cost a single rate-limit point.
+        latest: timelineItems(last: 100, itemTypes: [READY_FOR_REVIEW_EVENT, CONVERT_TO_DRAFT_EVENT, REVIEW_REQUESTED_EVENT]) {
+          pageInfo { hasNextPage }
           nodes {
             __typename
             ... on ReadyForReviewEvent { createdAt }
             ... on ConvertToDraftEvent { createdAt }
-            ... on ReviewRequestedEvent {
-              createdAt
-              requestedReviewer {
-                __typename
-                ... on User { login }
-                ... on Team { name }
-              }
-            }
+            ... on ReviewRequestedEvent { createdAt }
+          }
+        }
+        earliest: timelineItems(first: 100, itemTypes: [REVIEW_REQUESTED_EVENT]) {
+          pageInfo { hasNextPage }
+          nodes {
+            __typename
+            ... on ReviewRequestedEvent { createdAt }
           }
         }
       }

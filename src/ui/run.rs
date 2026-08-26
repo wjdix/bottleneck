@@ -35,9 +35,10 @@ enum Message {
 /// sync progress appear without the user pressing anything.
 const TICK: Duration = Duration::from_millis(250);
 
-pub async fn run(cfg: Config, store: Store, snapshot: Option<Snapshot>) -> Result<()> {
+pub async fn run(cfg: Config, store: Store, snapshots: Vec<Option<Snapshot>>) -> Result<()> {
     let mut terminal = setup()?;
-    let result = event_loop(&mut terminal, cfg, Arc::new(tokio::sync::Mutex::new(store)), snapshot).await;
+    let result =
+        event_loop(&mut terminal, cfg, Arc::new(tokio::sync::Mutex::new(store)), snapshots).await;
     // Restore the terminal even if the loop failed, so an error message is readable.
     restore(&mut terminal)?;
     result
@@ -75,9 +76,9 @@ async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     cfg: Config,
     store: Arc<tokio::sync::Mutex<Store>>,
-    snapshot: Option<Snapshot>,
+    snapshots: Vec<Option<Snapshot>>,
 ) -> Result<()> {
-    let mut app = App::new(cfg.clone(), snapshot);
+    let mut app = App::new(cfg.clone(), snapshots);
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
     loop {
@@ -110,7 +111,8 @@ async fn event_loop(
                                 app.status = SyncStatus::Running("starting".into());
                                 let tx = tx.clone();
                                 let cfg = cfg.clone();
-                                let repo = cfg.repos.first().cloned();
+                                // Refresh whichever repo the user is looking at.
+                                let repo = app.repo().cloned();
                                 let store = Arc::clone(&store);
                                 tokio::spawn(async move {
                                     let mut guard = store.lock().await;

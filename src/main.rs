@@ -52,15 +52,27 @@ struct Args {
     #[arg(long)]
     env: Option<String>,
 
+    /// Repository to act on, as owner/name. Defaults to the first configured.
+    #[arg(long, value_name = "OWNER/NAME")]
+    repo: Option<String>,
+
     /// Override the history window, in days.
     #[arg(long)]
     days: Option<i64>,
+
+    /// Use an alternate config file instead of the one in the platform config directory.
+    #[arg(long, value_name = "PATH")]
+    config: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let mut cfg = Config::load(&config::config_path()?)?;
+    let cfg_path = match args.config.clone() {
+        Some(p) => p,
+        None => config::config_path()?,
+    };
+    let mut cfg = Config::load(&cfg_path)?;
     if let Some(d) = args.days {
         cfg.window_days = d;
     }
@@ -71,52 +83,72 @@ async fn main() -> Result<()> {
     if args.dump_trunk {
         return dump_trunk(&cfg).await;
     }
-    if args.dump_deploys {
-        return dump_deploys(&cfg).await;
+
+    if cfg.repos.is_empty() {
+        anyhow::bail!(
+            "no repositories configured. Add one to {}",
+            cfg_path.display()
+        );
     }
 
     let db = config::db_path()?;
     let mut store = store::Store::open(&db)?;
-    let repo = cfg
-        .repos
-        .first()
-        .cloned()
-        .context("no repositories configured")?;
 
     if args.sync {
         let gh = GitHub::new(GitHub::resolve_token().await?)?;
-        let snap = sync::refresh(&gh, &mut store, &repo, &cfg, |stage| {
-            eprintln!("  {stage}...");
-        })
-        .await?;
-        eprintln!(
-            "synced {} PRs and {} trunk commits to {}",
-            snap.prs.len(),
-            snap.trunk.len(),
-            db.display()
-        );
+        for repo in &cfg.repos {
+            eprintln!("{}", repo.slug());
+            let snap = sync::refresh(&gh, &mut store, repo, &cfg, |stage| {
+                eprintln!("  {stage}...");
+            })
+            .await?;
+            eprintln!(
+                "  {} PRs, {} trunk commits",
+                snap.prs.len(),
+                snap.trunk.len()
+            );
+        }
+        eprintln!("cache: {}", db.display());
         return Ok(());
     }
 
     // Launch reads the cache only. Nothing here touches the network: a first run shows an empty
     // state telling the user to press r, rather than blocking on a fetch they did not ask for.
-    let snapshot = sync::load_cached(&store, &repo, &cfg)?;
-
-    if let Some(tab) = args.render.as_deref() {
-        return render_once(cfg, snapshot, tab, &args.size, args.env.as_deref());
+    let mut snapshots = Vec::with_capacity(cfg.repos.len());
+    for repo in &cfg.repos {
+        snapshots.push(sync::load_cached(&store, repo, &cfg)?);
     }
 
-    ui::run::run(cfg, store, snapshot).await
+    if args.dump_deploys {
+        for snap in snapshots.iter().flatten() {
+            dump_deploys(snap);
+        }
+        return Ok(());
+    }
+
+    if let Some(tab) = args.render.as_deref() {
+        return render_once(
+            cfg,
+            snapshots,
+            tab,
+            &args.size,
+            args.env.as_deref(),
+            args.repo.as_deref(),
+        );
+    }
+
+    ui::run::run(cfg, store, snapshots).await
 }
 
 /// Draw one tab into an in-memory terminal and print it, so cached data can be checked without a
 /// TTY.
 fn render_once(
     cfg: Config,
-    snapshot: Option<Snapshot>,
+    snapshots: Vec<Option<Snapshot>>,
     tab: &str,
     size: &str,
     env: Option<&str>,
+    repo: Option<&str>,
 ) -> Result<()> {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -136,8 +168,23 @@ fn render_once(
             format!("unknown tab {tab:?}; expected one of {}", names.join(", "))
         })?;
 
-    let mut app = App::new(cfg, snapshot);
+    let mut app = App::new(cfg, snapshots);
     app.tab = selected;
+    if let Some(slug) = repo {
+        // Cycle to the requested repo rather than indexing, so selection state stays consistent.
+        let n = app.repo_count();
+        let found = (0..n).any(|_| {
+            if app.repo().is_some_and(|r| r.slug() == slug) {
+                true
+            } else {
+                app.cycle_repo();
+                false
+            }
+        });
+        if !found && !app.repo().is_some_and(|r| r.slug() == slug) {
+            anyhow::bail!("repo {slug:?} is not in the config");
+        }
+    }
     if let Some(env) = env {
         app.env = env.to_string();
     }
@@ -193,7 +240,9 @@ async fn dump_trunk(cfg: &Config) -> Result<()> {
     let since = cfg.window_start();
 
     for repo in &cfg.repos {
-        let scan = fetch::fetch_history(&gh, repo, since).await?;
+        // Deliberately a full walk with no known-commit shortcut: this command exists to be
+        // diffed against `git log --first-parent`, so it must not stop early.
+        let scan = fetch::fetch_history(&gh, repo, since, &Default::default()).await?;
         let parents = scan
             .commits
             .iter()
@@ -224,14 +273,11 @@ async fn dump_trunk(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Stage-3 verification path: prints the analysed snapshot so every headline number can be checked
-/// against GitHub by hand before any UI exists.
-async fn dump_deploys(cfg: &Config) -> Result<()> {
-    let gh = GitHub::new(GitHub::resolve_token().await?)?;
-
-    for repo in &cfg.repos {
-        let snap = Snapshot::fetch(&gh, repo, cfg, |stage| eprintln!("  fetching {stage}...")).await?;
-
+/// Print the analysed snapshot as plain text, so every headline number can be checked against
+/// GitHub by hand. Reads the cache; run `--sync` first.
+fn dump_deploys(snap: &Snapshot) {
+    {
+        let repo = &snap.repo;
         println!("=== {} ===", repo.slug());
         println!(
             "window from {}  |  {} PRs  |  trunk {} commits  |  {} tags skipped",
@@ -363,5 +409,4 @@ async fn dump_deploys(cfg: &Config) -> Result<()> {
             println!("  {:<28} {} reviews ({} approvals)", r.login, r.reviews_given, r.approvals_given);
         }
     }
-    Ok(())
 }

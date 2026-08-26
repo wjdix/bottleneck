@@ -79,7 +79,9 @@ impl PullRequest {
             _ => PrState::Open,
         };
 
-        let (ready_events, requested_events, timeline_truncated) = split_timeline(node);
+        // `latest` gives the tail of the timeline, `earliest` the head; see the query for why both.
+        let (ready_events, late_requests, timeline_truncated) = split_timeline(node.latest.as_ref());
+        let (_, early_requests, _) = split_timeline(node.earliest.as_ref());
 
         // The LAST ready-for-review event, not the first: a PR can go draft -> ready -> draft ->
         // ready (PR #2095 did), and the most recent transition is the one review latency is measured
@@ -102,7 +104,7 @@ impl PullRequest {
         let reviews_truncated = node
             .reviews
             .as_ref()
-            .is_some_and(|r| r.total_count as usize > r.nodes.len());
+            .is_some_and(|r| r.page_info.has_next_page);
 
         Self {
             number: node.number,
@@ -120,7 +122,11 @@ impl PullRequest {
             merge_commit_oid: node.merge_commit.as_ref().map(|c| c.oid.clone()),
             first_review_at,
             approved_at,
-            first_review_requested_at: requested_events.iter().min().copied(),
+            first_review_requested_at: early_requests
+                .iter()
+                .chain(&late_requests)
+                .min()
+                .copied(),
             reviews,
             labels: node
                 .labels
@@ -144,20 +150,23 @@ impl PullRequest {
     }
 }
 
-/// Pull the timestamps we care about out of the timeline, and report truncation.
+/// Pull ready-for-review and review-requested timestamps out of a timeline window, and report
+/// whether that window was truncated.
 fn split_timeline(
-    node: &model::PullRequestNode,
+    timeline: Option<&model::TimelineConnection>,
 ) -> (Vec<DateTime<Utc>>, Vec<DateTime<Utc>>, bool) {
-    let Some(timeline) = node.timeline_items.as_ref() else {
+    let Some(timeline) = timeline else {
         return (Vec::new(), Vec::new(), false);
     };
-    let truncated = timeline.total_count as usize > timeline.nodes.len();
+    // hasNextPage, not totalCount: totalCount ignores the itemTypes filter and counts the entire
+    // timeline, so comparing it against the returned nodes marks every PR as truncated.
+    let truncated = timeline.page_info.has_next_page;
     let mut ready = Vec::new();
     let mut requested = Vec::new();
     for item in &timeline.nodes {
         match item {
             model::TimelineItem::ReadyForReviewEvent { created_at } => ready.push(*created_at),
-            model::TimelineItem::ReviewRequestedEvent { created_at, .. } => {
+            model::TimelineItem::ReviewRequestedEvent { created_at } => {
                 requested.push(*created_at)
             }
             model::TimelineItem::ConvertToDraftEvent { .. } | model::TimelineItem::Other => {}

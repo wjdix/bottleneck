@@ -74,7 +74,12 @@ pub enum SyncStatus {
 
 pub struct App {
     pub cfg: Config,
-    pub snapshot: Option<Snapshot>,
+    /// One slot per configured repo, in config order. `None` means never synced.
+    ///
+    /// Kept parallel to `cfg.repos` rather than keyed by slug so that adding a repo to the config is
+    /// purely additive and needs no code change.
+    snapshots: Vec<Option<Snapshot>>,
+    repo_idx: usize,
     pub tab: Tab,
     pub sort: Sort,
     /// Index of the selected row in the active tab's table.
@@ -87,21 +92,26 @@ pub struct App {
     pub show_detail: bool,
     pub status: SyncStatus,
     pub should_quit: bool,
-    /// Set when there is no cached data at all, so the UI can say so instead of showing zeros.
-    pub never_synced: bool,
 }
 
 impl App {
-    pub fn new(cfg: Config, snapshot: Option<Snapshot>) -> Self {
-        let env = snapshot
-            .as_ref()
+    /// Build with one snapshot slot per configured repo.
+    pub fn new(cfg: Config, snapshots: Vec<Option<Snapshot>>) -> Self {
+        // Keep the slots aligned with the config even if a caller passes too few.
+        let mut snapshots = snapshots;
+        snapshots.resize_with(cfg.repos.len().max(1), || None);
+
+        let env = snapshots
+            .iter()
+            .flatten()
+            .next()
             .and_then(|s| s.envs.first().cloned())
             .or_else(|| cfg.envs.first().cloned())
             .unwrap_or_else(|| "prod".to_string());
         Self {
-            never_synced: snapshot.is_none(),
             cfg,
-            snapshot,
+            snapshots,
+            repo_idx: 0,
             tab: Tab::Pipeline,
             sort: Sort::WaitingLongest,
             selected: 0,
@@ -119,19 +129,70 @@ impl App {
         matches!(self.status, SyncStatus::Running(_))
     }
 
-    pub fn set_snapshot(&mut self, snap: Snapshot) {
-        if !snap.envs.contains(&self.env) {
-            if let Some(first) = snap.envs.first() {
-                self.env = first.clone();
-            }
+    /// The active repository's snapshot, if it has ever been synced.
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        self.snapshots.get(self.repo_idx).and_then(|s| s.as_ref())
+    }
+
+    /// True when the active repo has no cached data, so the UI can say so rather than show zeros.
+    pub fn never_synced(&self) -> bool {
+        self.snapshot().is_none()
+    }
+
+    /// The active repository.
+    pub fn repo(&self) -> Option<&crate::config::RepoConfig> {
+        self.cfg.repos.get(self.repo_idx)
+    }
+
+    pub fn repo_count(&self) -> usize {
+        self.cfg.repos.len()
+    }
+
+    pub fn repo_index(&self) -> usize {
+        self.repo_idx
+    }
+
+    /// Move to the next configured repo. A no-op when only one is configured.
+    pub fn cycle_repo(&mut self) {
+        if self.cfg.repos.len() < 2 {
+            return;
         }
-        self.snapshot = Some(snap);
-        self.never_synced = false;
+        self.repo_idx = (self.repo_idx + 1) % self.cfg.repos.len();
+        self.selected = 0;
+        // The new repo may not deploy to the env we were looking at.
+        if let Some(snap) = self.snapshot()
+            && !snap.envs.contains(&self.env)
+            && let Some(first) = snap.envs.first().cloned()
+        {
+            self.env = first;
+        }
+    }
+
+    /// Install a freshly synced snapshot into its repo's slot.
+    ///
+    /// Matched by slug rather than by the active index, because the user may have switched repos
+    /// while the sync was in flight.
+    pub fn set_snapshot(&mut self, snap: Snapshot) {
+        if !snap.envs.contains(&self.env)
+            && let Some(first) = snap.envs.first()
+        {
+            self.env = first.clone();
+        }
+        let slug = snap.repo.slug();
+        let idx = self
+            .cfg
+            .repos
+            .iter()
+            .position(|r| r.slug() == slug)
+            .unwrap_or(self.repo_idx);
+        if idx < self.snapshots.len() {
+            self.snapshots[idx] = Some(snap);
+        }
         self.clamp_selection();
     }
 
     pub fn synced_at(&self) -> Option<DateTime<Utc>> {
-        self.snapshot.as_ref().map(|s| s.synced_at)
+        self.snapshot().map(|s| s.synced_at)
     }
 
     /// Rows for the active tab, already filtered and sorted.
@@ -139,7 +200,7 @@ impl App {
     /// Returned as index pairs into the snapshot so callers can reach both the PR and its metrics
     /// without cloning either.
     pub fn rows(&self) -> Vec<(&PullRequest, &PrMetrics)> {
-        let Some(snap) = self.snapshot.as_ref() else {
+        let Some(snap) = self.snapshot() else {
             return Vec::new();
         };
         let needle = self.filter.to_lowercase();
@@ -195,7 +256,7 @@ impl App {
 
     pub fn row_count(&self) -> usize {
         match self.tab {
-            Tab::People => self.snapshot.as_ref().map_or(0, |s| {
+            Tab::People => self.snapshot().map_or(0, |s| {
                 s.people.iter().filter(|p| p.total() > 0).count()
             }),
             _ => self.rows().len(),
@@ -213,8 +274,7 @@ impl App {
 
     /// Deploy environments available, for the env cycler.
     pub fn envs(&self) -> Vec<String> {
-        self.snapshot
-            .as_ref()
+        self.snapshot()
             .map(|s| s.envs.clone())
             .unwrap_or_else(|| self.cfg.envs.clone())
     }
@@ -230,7 +290,7 @@ impl App {
 
     /// Per-env coverage caveat for the selected env, when it is worth showing.
     pub fn coverage_warning(&self) -> Option<String> {
-        let snap = self.snapshot.as_ref()?;
+        let snap = self.snapshot()?;
         let cov = snap.coverage.get(&self.env)?;
         cov.is_partial().then(|| {
             format!(
@@ -303,6 +363,7 @@ pub fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Action {
         }
         KeyCode::Char('s') => app.sort = app.sort.next(),
         KeyCode::Char('e') => app.cycle_env(),
+        KeyCode::Char('R') => app.cycle_repo(),
         KeyCode::Tab | KeyCode::Right => {
             app.tab = app.tab.next();
             app.selected = 0;
@@ -346,7 +407,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn app() -> App {
-        App::new(Config::default(), None)
+        App::new(Config::default(), vec![None])
     }
 
     fn press(app: &mut App, code: KeyCode) -> Action {
@@ -463,10 +524,72 @@ mod tests {
         assert!(!a.show_help);
     }
 
+    fn two_repo_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.repos.push(crate::config::RepoConfig {
+            owner: "pagos-ai".into(),
+            name: "other".into(),
+            default_branch: "main".into(),
+        });
+        cfg
+    }
+
+    #[test]
+    fn capital_r_cycles_repositories() {
+        let mut a = App::new(two_repo_cfg(), vec![None, None]);
+        assert_eq!(a.repo().unwrap().slug(), "pagos-ai/pagos");
+        press(&mut a, KeyCode::Char('R'));
+        assert_eq!(a.repo().unwrap().slug(), "pagos-ai/other");
+        press(&mut a, KeyCode::Char('R'));
+        assert_eq!(a.repo().unwrap().slug(), "pagos-ai/pagos", "wraps around");
+    }
+
+    #[test]
+    fn cycling_repos_is_a_no_op_with_one_repo() {
+        let mut a = app();
+        assert_eq!(a.repo_count(), 1);
+        press(&mut a, KeyCode::Char('R'));
+        assert_eq!(a.repo_index(), 0);
+    }
+
+    /// Each repo keeps its own cached data, so switching must not show the other repo's numbers.
+    #[test]
+    fn each_repo_has_its_own_snapshot_slot() {
+        let snap = crate::snapshot::fixtures::snapshot();
+        let mut a = App::new(two_repo_cfg(), vec![Some(snap), None]);
+        assert!(!a.never_synced());
+        press(&mut a, KeyCode::Char('R'));
+        assert!(a.never_synced(), "the second repo was never synced");
+        press(&mut a, KeyCode::Char('R'));
+        assert!(!a.never_synced());
+    }
+
+    /// A sync finishing after the user switched repos must land in the right slot.
+    #[test]
+    fn a_finished_sync_lands_in_its_own_repos_slot() {
+        let mut a = App::new(two_repo_cfg(), vec![None, None]);
+        // User switches to repo 2 while a sync for repo 1 is still running.
+        press(&mut a, KeyCode::Char('R'));
+        assert_eq!(a.repo_index(), 1);
+
+        a.set_snapshot(crate::snapshot::fixtures::snapshot()); // this is pagos-ai/pagos
+        assert!(a.never_synced(), "repo 2 must still be empty");
+        press(&mut a, KeyCode::Char('R'));
+        assert!(!a.never_synced(), "repo 1 received the snapshot");
+    }
+
+    /// The config having more repos than the caller passed slots for must not panic.
+    #[test]
+    fn slots_are_padded_to_match_the_config() {
+        let a = App::new(two_repo_cfg(), vec![]);
+        assert_eq!(a.repo_count(), 2);
+        assert!(a.snapshot().is_none());
+    }
+
     #[test]
     fn no_snapshot_is_reported_rather_than_shown_as_zeros() {
         let a = app();
-        assert!(a.never_synced);
+        assert!(a.never_synced());
         assert_eq!(a.row_count(), 0);
         assert!(a.rows().is_empty());
     }

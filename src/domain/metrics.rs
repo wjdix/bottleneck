@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Duration, Utc};
 
+use crate::config::Config;
 use crate::domain::pr::{PrState, PullRequest};
 use crate::domain::trunk::{DeployState, EnvTags, Trunk, resolve_deploy};
 
@@ -153,16 +154,24 @@ impl PersonLoad {
     }
 }
 
-/// Per-author work in flight, busiest first.
+/// Per-person work in flight, busiest first.
 ///
-/// The draft/ready split is the point: this repo has 85 open PRs of which 51 are drafts, and two
-/// people sit at 18 open / 14 draft. "18 threads" and "4 threads plus a deep backlog" are very
-/// different situations and a single count conflates them.
-pub fn person_loads(prs: &[PullRequest], now: DateTime<Utc>) -> Vec<PersonLoad> {
+/// The draft/ready split is the point: `pagos-ai/pagos` has 85 open PRs of which 48 are drafts, and
+/// two people sit at 18 open / 14 draft. "18 threads" and "4 threads plus a deep backlog" are very
+/// different situations, and a single count conflates them.
+///
+/// Bot authors are excluded. This answers "how many threads is each team member carrying", and
+/// `dependabot` sitting on four open PRs in `pagos-web` is not a person with a workload. Their PRs
+/// still appear everywhere else, including the awaiting-review list, because they do still need
+/// someone's attention.
+pub fn person_loads(prs: &[PullRequest], cfg: &Config, now: DateTime<Utc>) -> Vec<PersonLoad> {
     let mut by_author: HashMap<&str, PersonLoad> = HashMap::new();
     let mut merge_times: HashMap<&str, Vec<Duration>> = HashMap::new();
 
     for pr in prs {
+        if cfg.is_bot(&pr.author) {
+            continue;
+        }
         let entry = by_author.entry(&pr.author).or_insert_with(|| PersonLoad {
             author: pr.author.clone(),
             ..Default::default()

@@ -177,6 +177,169 @@ impl Store {
         Ok(())
     }
 
+    /// When this repo was last synced, if ever. Used as the incremental watermark.
+    pub fn watermark(&self, repo: &RepoConfig) -> Result<Option<DateTime<Utc>>> {
+        let Some(id): Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM repos WHERE owner = ?1 AND name = ?2",
+                params![repo.owner, repo.name],
+                |r| r.get(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        // A watermark without cached commits is useless: the trunk could not be rebuilt.
+        let commits: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM commits WHERE repo_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if commits == 0 {
+            return Ok(None);
+        }
+        Ok(self.state(id, KEY_SYNCED_AT)?.and_then(|s| parse_ts(&s)))
+    }
+
+    /// Every commit oid already cached, so an incremental history fetch knows when to stop.
+    pub fn known_commits(&self, repo: &RepoConfig) -> Result<std::collections::HashSet<String>> {
+        let Some(id): Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM repos WHERE owner = ?1 AND name = ?2",
+                params![repo.owner, repo.name],
+                |r| r.get(0),
+            )
+            .optional()?
+        else {
+            return Ok(Default::default());
+        };
+        let mut stmt = self
+            .conn
+            .prepare("SELECT oid FROM commits WHERE repo_id = ?1")?;
+        let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Merge freshly fetched data into the cache without discarding what is already there.
+    ///
+    /// This is the incremental counterpart to [`Store::save`]. Fetched PRs replace their cached
+    /// versions; untouched ones are left alone. Commits and tags are additive.
+    ///
+    /// Pruning matters for correctness, not just size: the window start advances every day, so
+    /// without it the cache would keep accumulating PRs and quietly stop describing "the last N
+    /// days". Open PRs are exempt, since an abandoned open PR is a stuck thread that must stay
+    /// visible however old it is.
+    pub fn merge(
+        &mut self,
+        repo: &RepoConfig,
+        prs: &[PullRequest],
+        history: &HistoryScan,
+        tags_by_env: &BTreeMap<String, Vec<DeployTag>>,
+        synced_at: DateTime<Utc>,
+        window_start: DateTime<Utc>,
+    ) -> Result<()> {
+        let id = self.repo_id(repo)?;
+        let tx = self.conn.transaction()?;
+
+        {
+            let mut del_labels =
+                tx.prepare("DELETE FROM pr_labels WHERE repo_id = ?1 AND number = ?2")?;
+            let mut del_reviews =
+                tx.prepare("DELETE FROM reviews WHERE repo_id = ?1 AND number = ?2")?;
+            let mut ins_pr = tx.prepare(
+                "INSERT OR REPLACE INTO prs (repo_id, number, title, author, state, is_draft,
+                        base_ref, head_ref, created_at, updated_at, ready_at, merged_at, closed_at,
+                        merge_commit_oid, additions, deletions, changed_files, truncated)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            )?;
+            let mut ins_label = tx.prepare(
+                "INSERT OR IGNORE INTO pr_labels (repo_id, number, label) VALUES (?1,?2,?3)",
+            )?;
+            let mut ins_review = tx.prepare(
+                "INSERT OR IGNORE INTO reviews (repo_id, number, author, state, submitted_at)
+                 VALUES (?1,?2,?3,?4,?5)",
+            )?;
+
+            for pr in prs {
+                // Replace the children outright: a review can be dismissed, and a label removed.
+                del_labels.execute(params![id, pr.number])?;
+                del_reviews.execute(params![id, pr.number])?;
+                ins_pr.execute(params![
+                    id, pr.number, pr.title, pr.author, state_str(pr.state), pr.is_draft as i64,
+                    pr.base_ref, pr.head_ref, ts(pr.created_at), ts(pr.updated_at),
+                    pr.ready_at.map(ts), pr.merged_at.map(ts), pr.closed_at.map(ts),
+                    pr.merge_commit_oid, pr.additions, pr.deletions, pr.changed_files,
+                    pr.truncated as i64,
+                ])?;
+                for label in &pr.labels {
+                    ins_label.execute(params![id, pr.number, label])?;
+                }
+                for review in &pr.reviews {
+                    ins_review.execute(params![
+                        id, pr.number, review.author, review.state, ts(review.submitted_at)
+                    ])?;
+                }
+            }
+
+            let mut ins_commit = tx.prepare(
+                "INSERT OR IGNORE INTO commits
+                   (repo_id, oid, committed_date, first_parent_oid, parent_count)
+                 VALUES (?1,?2,?3,?4,?5)",
+            )?;
+            for c in &history.commits {
+                ins_commit.execute(params![
+                    id, c.oid, ts(c.committed_date), c.first_parent, c.parent_count
+                ])?;
+            }
+
+            let mut ins_tag = tx.prepare(
+                "INSERT OR REPLACE INTO deploy_tags
+                   (repo_id, name, env, component, deployed_at, commit_oid, commit_date)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            )?;
+            for (env, tags) in tags_by_env {
+                for t in tags {
+                    ins_tag.execute(params![
+                        id, t.name, env, t.parsed.component, ts(t.parsed.name_ts),
+                        t.commit_oid, ts(t.commit_date)
+                    ])?;
+                }
+            }
+
+            // Prune what has aged out of the window. Open PRs are deliberately exempt.
+            let cutoff = ts(window_start);
+            tx.execute(
+                "DELETE FROM pr_labels WHERE repo_id = ?1 AND number IN
+                   (SELECT number FROM prs WHERE repo_id = ?1 AND state != 'OPEN' AND updated_at < ?2)",
+                params![id, cutoff],
+            )?;
+            tx.execute(
+                "DELETE FROM reviews WHERE repo_id = ?1 AND number IN
+                   (SELECT number FROM prs WHERE repo_id = ?1 AND state != 'OPEN' AND updated_at < ?2)",
+                params![id, cutoff],
+            )?;
+            tx.execute(
+                "DELETE FROM prs WHERE repo_id = ?1 AND state != 'OPEN' AND updated_at < ?2",
+                params![id, cutoff],
+            )?;
+            tx.execute(
+                "DELETE FROM deploy_tags WHERE repo_id = ?1 AND commit_date < ?2",
+                params![id, cutoff],
+            )?;
+
+            let mut ins_state = tx.prepare(
+                "INSERT OR REPLACE INTO sync_state (repo_id, key, value) VALUES (?1,?2,?3)",
+            )?;
+            ins_state.execute(params![id, KEY_SYNCED_AT, ts(synced_at)])?;
+            ins_state.execute(params![id, KEY_HEAD, history.head])?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Load a repo's cached data, or `None` if it was never synced.
     pub fn load(&self, repo: &RepoConfig) -> Result<Option<CachedRepo>> {
         let Some(id): Option<i64> = self
@@ -568,6 +731,151 @@ mod tests {
     fn unsynced_repo_loads_as_none() {
         let store = Store::open_in_memory().unwrap();
         assert!(store.load(&repo()).unwrap().is_none());
+    }
+
+    /// Incremental refresh must leave PRs it did not fetch untouched.
+    #[test]
+    fn merge_preserves_prs_it_did_not_fetch() {
+        let mut store = Store::open_in_memory().unwrap();
+        let repo = repo();
+        let mut old = sample_pr();
+        old.number = 1000;
+        store
+            .save(&repo, &[old, sample_pr()], &sample_history(), &sample_tags(), Utc::now())
+            .unwrap();
+
+        // A refresh that only saw PR 2102.
+        store
+            .merge(
+                &repo,
+                &[sample_pr()],
+                &sample_history(),
+                &sample_tags(),
+                Utc::now(),
+                t("2020-01-01T00:00:00Z"),
+            )
+            .unwrap();
+
+        let numbers: Vec<i64> = store
+            .load(&repo)
+            .unwrap()
+            .unwrap()
+            .prs
+            .iter()
+            .map(|p| p.number)
+            .collect();
+        assert!(numbers.contains(&1000), "untouched PR must survive: {numbers:?}");
+        assert!(numbers.contains(&2102));
+    }
+
+    /// A dismissed review or a removed label must actually disappear, not linger from the old row.
+    #[test]
+    fn merge_replaces_a_prs_reviews_and_labels() {
+        let mut store = Store::open_in_memory().unwrap();
+        let repo = repo();
+        store
+            .save(&repo, &[sample_pr()], &sample_history(), &sample_tags(), Utc::now())
+            .unwrap();
+
+        let mut updated = sample_pr();
+        updated.reviews.truncate(1);
+        updated.labels = vec!["type:bugfix".into()];
+        store
+            .merge(
+                &repo,
+                &[updated],
+                &sample_history(),
+                &sample_tags(),
+                Utc::now(),
+                t("2020-01-01T00:00:00Z"),
+            )
+            .unwrap();
+
+        let pr = &store.load(&repo).unwrap().unwrap().prs[0];
+        assert_eq!(pr.reviews.len(), 1, "the dismissed review must be gone");
+        assert_eq!(pr.labels, vec!["type:bugfix"]);
+    }
+
+    /// The window advances daily, so aged-out closed PRs must be pruned or the cache stops
+    /// describing "the last N days". Open PRs are exempt — an abandoned one is a stuck thread.
+    #[test]
+    fn merge_prunes_aged_out_closed_prs_but_keeps_open_ones() {
+        let mut store = Store::open_in_memory().unwrap();
+        let repo = repo();
+
+        let mut stale_closed = sample_pr();
+        stale_closed.number = 500;
+        stale_closed.state = PrState::Merged;
+        stale_closed.updated_at = t("2025-01-01T00:00:00Z");
+
+        let mut stale_open = sample_pr();
+        stale_open.number = 501;
+        stale_open.state = PrState::Open;
+        stale_open.merged_at = None;
+        stale_open.updated_at = t("2025-01-01T00:00:00Z");
+
+        store
+            .save(
+                &repo,
+                &[stale_closed, stale_open, sample_pr()],
+                &sample_history(),
+                &sample_tags(),
+                Utc::now(),
+            )
+            .unwrap();
+
+        store
+            .merge(
+                &repo,
+                &[sample_pr()],
+                &sample_history(),
+                &sample_tags(),
+                Utc::now(),
+                t("2026-06-01T00:00:00Z"),
+            )
+            .unwrap();
+
+        let numbers: Vec<i64> = store
+            .load(&repo)
+            .unwrap()
+            .unwrap()
+            .prs
+            .iter()
+            .map(|p| p.number)
+            .collect();
+        assert!(!numbers.contains(&500), "stale closed PR must be pruned: {numbers:?}");
+        assert!(
+            numbers.contains(&501),
+            "stale OPEN PR must survive — it is the most stuck thread there is: {numbers:?}"
+        );
+        assert!(numbers.contains(&2102));
+    }
+
+    #[test]
+    fn watermark_is_absent_until_a_sync_has_stored_commits() {
+        let mut store = Store::open_in_memory().unwrap();
+        let repo = repo();
+        assert!(store.watermark(&repo).unwrap().is_none());
+
+        let synced = t("2026-08-26T15:00:00Z");
+        store
+            .save(&repo, &[sample_pr()], &sample_history(), &sample_tags(), synced)
+            .unwrap();
+        assert_eq!(store.watermark(&repo).unwrap(), Some(synced));
+    }
+
+    #[test]
+    fn known_commits_reports_what_is_cached() {
+        let mut store = Store::open_in_memory().unwrap();
+        let repo = repo();
+        assert!(store.known_commits(&repo).unwrap().is_empty());
+        store
+            .save(&repo, &[sample_pr()], &sample_history(), &sample_tags(), Utc::now())
+            .unwrap();
+        let known = store.known_commits(&repo).unwrap();
+        assert!(known.contains("b2fba4ae"));
+        assert!(known.contains("51558579"));
+        assert_eq!(known.len(), 2);
     }
 
     #[test]

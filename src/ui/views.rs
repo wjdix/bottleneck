@@ -24,7 +24,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_tabs(f, chunks[0], app);
 
-    if app.never_synced {
+    if app.never_synced() {
         draw_empty(f, chunks[1], app);
     } else {
         match app.tab {
@@ -64,9 +64,7 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_empty(f: &mut Frame, area: Rect, app: &App) {
     let repo = app
-        .cfg
-        .repos
-        .first()
+        .repo()
         .map(|r| r.slug())
         .unwrap_or_else(|| "(no repo configured)".into());
     let text = vec![
@@ -88,7 +86,7 @@ fn draw_empty(f: &mut Frame, area: Rect, app: &App) {
 // ------------------------------------------------------------------ pipeline
 
 fn pipeline(f: &mut Frame, area: Rect, app: &App) {
-    let Some(snap) = app.snapshot.as_ref() else { return };
+    let Some(snap) = app.snapshot() else { return };
     let agg = &snap.aggregates;
 
     let rows = Layout::vertical([
@@ -233,7 +231,7 @@ fn pipeline(f: &mut Frame, area: Rect, app: &App) {
 // -------------------------------------------------------------------- review
 
 fn review(f: &mut Frame, area: Rect, app: &App) {
-    let Some(snap) = app.snapshot.as_ref() else { return };
+    let Some(snap) = app.snapshot() else { return };
     let split = Layout::horizontal([Constraint::Min(40), Constraint::Length(38)]).split(area);
     let now = Utc::now();
 
@@ -313,7 +311,7 @@ fn review(f: &mut Frame, area: Rect, app: &App) {
 // -------------------------------------------------------------------- people
 
 fn people(f: &mut Frame, area: Rect, app: &App) {
-    let Some(snap) = app.snapshot.as_ref() else { return };
+    let Some(snap) = app.snapshot() else { return };
 
     let rows: Vec<Row> = snap
         .people
@@ -513,9 +511,18 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    if let Some(snap) = app.snapshot.as_ref() {
+    if let Some(repo) = app.repo() {
+        let of = if app.repo_count() > 1 {
+            format!(" ({}/{})", app.repo_index() + 1, app.repo_count())
+        } else {
+            String::new()
+        };
+        let prs = app
+            .snapshot()
+            .map(|s| format!("{} PRs", s.prs.len()))
+            .unwrap_or_else(|| "not synced".into());
         spans.push(Span::styled(
-            format!("│ {} │ env {} │ {} PRs ", snap.repo.slug(), app.env, snap.prs.len()),
+            format!("│ {}{of} │ env {} │ {prs} ", repo.slug(), app.env),
             DIM,
         ));
     }
@@ -533,8 +540,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
+    let repo_key = if app.repo_count() > 1 { "  R repo" } else { "" };
     spans.push(Span::styled(
-        "│ r refresh  e env  s sort  / filter  ? help  q quit",
+        format!("│ r refresh{repo_key}  e env  s sort  / filter  ? help  q quit"),
         DIM,
     ));
 
@@ -659,6 +667,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("Enter", "PR detail"),
         ("r", "refresh from GitHub"),
         ("e", "cycle deploy environment"),
+        ("R", "switch repository"),
         ("s", "cycle sort order"),
         ("/", "filter by title, author, number or label"),
         ("Esc", "close overlay or clear filter"),
@@ -728,7 +737,7 @@ mod tests {
     }
 
     fn app_with_data() -> App {
-        App::new(Config::default(), Some(fixtures::snapshot()))
+        App::new(Config::default(), vec![Some(fixtures::snapshot())])
     }
 
     #[test]
@@ -760,7 +769,7 @@ mod tests {
 
     #[test]
     fn empty_state_tells_the_user_to_refresh() {
-        let app = App::new(Config::default(), None);
+        let app = App::new(Config::default(), vec![None]);
         let out = render(&app, 80, 24);
         assert!(out.contains("No cached data"), "got:\n{out}");
         assert!(out.contains("Press r"), "got:\n{out}");
