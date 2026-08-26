@@ -59,11 +59,15 @@ query($owner: String!, $name: String!, $branch: String!, $cursor: String) {
 ///
 /// `reviews`/`timelineItems` page sizes can truncate on unusually busy PRs; `totalCount` is
 /// selected so the sync can detect that and backfill rather than silently using partial data.
+///
+/// `states` is a parameter because open PRs must be fetched without a time cutoff: an open PR
+/// untouched for nine months is exactly the stuck thread this tool exists to surface, and a
+/// window filter would drop it.
 pub const PULL_REQUESTS: &str = r#"
-query($owner: String!, $name: String!, $cursor: String) {
+query($owner: String!, $name: String!, $states: [PullRequestState!]!, $cursor: String) {
   rateLimit { cost remaining }
   repository(owner: $owner, name: $name) {
-    pullRequests(first: 50, after: $cursor, states: [OPEN, CLOSED, MERGED],
+    pullRequests(first: 50, after: $cursor, states: $states,
                  orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
       nodes {

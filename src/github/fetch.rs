@@ -225,11 +225,16 @@ fn trunk_reaches_back_to(
     false
 }
 
-/// Fetch PRs updated at or after `since`, newest-updated first.
+/// Fetch PRs in the given states, newest-updated first.
+///
+/// `since` bounds the scan when present. Pass `None` to take every PR in those states regardless of
+/// age — required for open PRs, since a long-abandoned open PR is a stuck thread and must still be
+/// counted even though nothing has touched it inside the window.
 pub async fn fetch_pull_requests(
     gh: &GitHub,
     repo: &RepoConfig,
-    since: DateTime<Utc>,
+    states: &[&str],
+    since: Option<DateTime<Utc>>,
     mut on_page: impl FnMut(usize),
 ) -> Result<Vec<model::PullRequestNode>> {
     let mut out: Vec<model::PullRequestNode> = Vec::new();
@@ -240,7 +245,8 @@ pub async fn fetch_pull_requests(
             .query(
                 queries::PULL_REQUESTS,
                 serde_json::json!({
-                    "owner": repo.owner, "name": repo.name, "cursor": cursor,
+                    "owner": repo.owner, "name": repo.name,
+                    "states": states, "cursor": cursor,
                 }),
             )
             .await
@@ -249,7 +255,9 @@ pub async fn fetch_pull_requests(
         let conn = resp.repository.pull_requests;
         let mut past_window = false;
         for node in conn.nodes {
-            if node.updated_at < since {
+            if let Some(cutoff) = since
+                && node.updated_at < cutoff
+            {
                 past_window = true;
                 continue;
             }
