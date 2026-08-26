@@ -4,6 +4,8 @@ mod config;
 mod domain;
 mod github;
 mod snapshot;
+mod store;
+mod sync;
 
 use anyhow::Result;
 use clap::Parser;
