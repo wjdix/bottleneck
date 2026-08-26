@@ -4,9 +4,11 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 
 use crate::config::RepoConfig;
 use crate::domain::deploy::{ParsedTag, parse_tag};
+use crate::domain::trunk::ParentMap;
 use crate::github::{GitHub, model, queries};
 
 /// A deploy tag resolved to its target commit.
@@ -98,19 +100,43 @@ pub async fn fetch_tags(
     Ok(scan)
 }
 
-/// Fetch commits reachable from the default branch until `since` is passed.
+/// Result of fetching branch history.
+pub struct HistoryScan {
+    /// Every commit fetched, in the order returned.
+    pub commits: Vec<Commit>,
+    /// The branch head, i.e. the trunk's index 0.
+    pub head: String,
+    pub pages: usize,
+}
+
+/// Maximum history pages, as a runaway guard. At 100 commits/page this is 50k commits, far beyond
+/// any sane window.
+const MAX_HISTORY_PAGES: usize = 500;
+
+/// Fetch commits reachable from the default branch, until the *first-parent trunk* is covered back
+/// to `since`.
 ///
-/// This walks *all* ancestors (GraphQL offers no first-parent filter), so it also pulls in
-/// side-history from merge commits. That's fine and in fact necessary: the trunk walk needs each
-/// commit's first parent to be resolvable, and off-trunk commits are simply never indexed.
+/// The termination condition is deliberately about trunk coverage rather than "first commit older
+/// than `since`". GraphQL's `history` returns all ancestors, and this repo's monorepo imports
+/// (`parrot`, `nest`) contribute commits dated years earlier than the merge that brought them in —
+/// so a naive "stop at the first old commit" check can halt while the trunk is still incomplete.
+/// Walking the trunk after each page and checking how far back it actually reaches is immune to
+/// whatever order the API returns.
+///
+/// In practice this is cheap: for a 90-day window on `pagos-ai/pagos`, all-ancestors in range is 774
+/// commits against 765 on the trunk, so it settles in ~8 pages.
 pub async fn fetch_history(
     gh: &GitHub,
     repo: &RepoConfig,
     since: DateTime<Utc>,
-) -> Result<Vec<Commit>> {
+) -> Result<HistoryScan> {
     let branch = format!("refs/heads/{}", repo.default_branch);
-    let mut out = Vec::new();
+    let mut commits: Vec<Commit> = Vec::new();
+    let mut dates: HashMap<String, DateTime<Utc>> = HashMap::new();
+    let mut parents: ParentMap = HashMap::new();
+    let mut head: Option<String> = None;
     let mut cursor: Option<String> = None;
+    let mut pages = 0usize;
 
     loop {
         let resp: model::HistoryResponse = gh
@@ -130,22 +156,31 @@ pub async fn fetch_history(
             .and_then(|r| r.target)
             .map(|t| t.history)
             .with_context(|| format!("branch {branch} not found in {}", repo.slug()))?;
+        pages += 1;
 
-        let mut past_window = false;
         for node in history.nodes {
-            if node.committed_date < since {
-                past_window = true;
+            if head.is_none() {
+                head = Some(node.oid.clone());
             }
-            out.push(Commit {
-                first_parent: node.parents.nodes.first().map(|p| p.oid.clone()),
-                parent_count: node.parents.total_count,
+            let first_parent = node.parents.nodes.first().map(|p| p.oid.clone());
+            dates.insert(node.oid.clone(), node.committed_date);
+            parents.insert(node.oid.clone(), first_parent.clone());
+            commits.push(Commit {
                 oid: node.oid,
                 committed_date: node.committed_date,
+                first_parent,
+                parent_count: node.parents.total_count,
             });
         }
 
-        // Keep going one page past the window edge so the trunk walk has a parent to land on.
-        if past_window || !history.page_info.has_next_page {
+        let Some(head_oid) = head.as_deref() else {
+            break; // empty branch
+        };
+
+        if trunk_reaches_back_to(head_oid, &parents, &dates, since) {
+            break;
+        }
+        if !history.page_info.has_next_page || pages >= MAX_HISTORY_PAGES {
             break;
         }
         cursor = history.page_info.end_cursor;
@@ -154,7 +189,40 @@ pub async fn fetch_history(
         }
     }
 
-    Ok(out)
+    let head = head.with_context(|| format!("{} has no commits on {branch}", repo.slug()))?;
+    Ok(HistoryScan { commits, head, pages })
+}
+
+/// True once the first-parent walk from `head` has reached a commit at or before `since`, or has
+/// run out of trunk (root commit reached).
+fn trunk_reaches_back_to(
+    head: &str,
+    parents: &ParentMap,
+    dates: &HashMap<String, DateTime<Utc>>,
+    since: DateTime<Utc>,
+) -> bool {
+    let mut cursor = Some(head.to_string());
+    let mut steps = 0usize;
+    while let Some(oid) = cursor {
+        match dates.get(&oid) {
+            // Reached far enough back on the trunk.
+            Some(d) if *d < since => return true,
+            Some(_) => {}
+            // This trunk commit hasn't been fetched yet: need more pages.
+            None => return false,
+        }
+        match parents.get(&oid) {
+            Some(Some(parent)) => cursor = Some(parent.clone()),
+            // Root commit: the whole trunk is covered.
+            Some(None) => return true,
+            None => return false,
+        }
+        steps += 1;
+        if steps > parents.len() {
+            return true; // defensive: cannot make progress
+        }
+    }
+    false
 }
 
 /// Fetch PRs updated at or after `since`, newest-updated first.
