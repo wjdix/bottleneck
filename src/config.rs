@@ -1,10 +1,11 @@
 //! Configuration: which repos to watch, how each one names its deploy tags, and what counts as a
 //! bot.
 //!
-//! Lives at the platform config dir (`~/Library/Application Support/bottleneck/config.toml` on
-//! macOS), or wherever `--config` points. There is no built-in repository: every repo, its envs and
-//! its tag convention come from the file, so a missing file is an error rather than a silent
-//! default. `config.example.toml` at the repo root is a working starting point.
+//! Lives at `$XDG_CONFIG_HOME/bottleneck/config.toml` (default `~/.config/bottleneck/`) on macOS
+//! and Linux, `%APPDATA%\bottleneck\config\config.toml` on Windows, or wherever `--config`
+//! points; see [`config_path`]. There is no built-in repository: every repo, its envs and its tag
+//! convention come from the file, so a missing file is an error rather than a silent default.
+//! `config.example.toml` at the repo root is a working starting point.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer};
@@ -119,8 +120,35 @@ fn project_dirs() -> Result<directories::ProjectDirs> {
         .context("could not determine platform config/data directories")
 }
 
+/// Where the config file is expected.
+///
+/// XDG on every Unix, macOS included. `directories` would give macOS `~/Library/Application
+/// Support`, which is Apple's convention for GUI apps, but terminal tools there (`gh`, `git`, `jj`,
+/// `nvim`) live in `~/.config`, and that's where users of a CLI look and keep their dotfiles.
+/// Windows keeps its native `%APPDATA%` location.
 pub fn config_path() -> Result<PathBuf> {
-    Ok(project_dirs()?.config_dir().join("config.toml"))
+    #[cfg(unix)]
+    let dir = {
+        let home = directories::BaseDirs::new()
+            .context("could not determine the home directory")?
+            .home_dir()
+            .to_path_buf();
+        unix_config_dir(std::env::var_os("XDG_CONFIG_HOME"), &home)
+    };
+    #[cfg(not(unix))]
+    let dir = project_dirs()?.config_dir().to_path_buf();
+    Ok(dir.join("config.toml"))
+}
+
+/// `$XDG_CONFIG_HOME/bottleneck`, falling back to `~/.config/bottleneck`. Per the XDG spec a
+/// relative or empty `XDG_CONFIG_HOME` is invalid and ignored.
+#[cfg(unix)]
+fn unix_config_dir(xdg_config_home: Option<std::ffi::OsString>, home: &Path) -> PathBuf {
+    xdg_config_home
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".config"))
+        .join("bottleneck")
 }
 
 /// Path to the SQLite cache, creating the parent directory if needed.
@@ -189,6 +217,44 @@ mod tests {
         let toml = MINIMAL.replace("deploy/{env}/{timestamp}", "deploy/{timestamp}");
         let err = format!("{:#}", Config::parse(&toml).unwrap_err());
         assert!(err.contains("{env}"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    mod unix_config_dir {
+        use super::super::unix_config_dir;
+        use std::ffi::OsString;
+        use std::path::{Path, PathBuf};
+
+        const HOME: &str = "/home/alice";
+
+        #[test]
+        fn defaults_to_dot_config_under_home() {
+            assert_eq!(
+                unix_config_dir(None, Path::new(HOME)),
+                PathBuf::from("/home/alice/.config/bottleneck")
+            );
+        }
+
+        #[test]
+        fn honours_xdg_config_home() {
+            let xdg = Some(OsString::from("/srv/cfg"));
+            assert_eq!(
+                unix_config_dir(xdg, Path::new(HOME)),
+                PathBuf::from("/srv/cfg/bottleneck")
+            );
+        }
+
+        /// The XDG spec says relative and empty values are invalid and must be ignored.
+        #[test]
+        fn ignores_relative_or_empty_xdg_config_home() {
+            for bad in ["cfg", ""] {
+                assert_eq!(
+                    unix_config_dir(Some(OsString::from(bad)), Path::new(HOME)),
+                    PathBuf::from("/home/alice/.config/bottleneck"),
+                    "XDG_CONFIG_HOME={bad:?}"
+                );
+            }
+        }
     }
 
     /// The pre-per-repo layout. Silently ignoring it would drop every env.

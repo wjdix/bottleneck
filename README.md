@@ -12,7 +12,7 @@ It loads from a local SQLite cache at launch and only touches the network when y
 
 ```sh
 cargo build --release
-cp config.example.toml ~/Library/Application\ Support/bottleneck/config.toml   # then edit
+mkdir -p ~/.config/bottleneck && cp config.example.toml ~/.config/bottleneck/config.toml  # then edit
 
 ./target/release/bottleneck --sync     # first fetch (~70s for ~1000 PRs)
 ./target/release/bottleneck            # launch the TUI (instant, reads the cache)
@@ -35,8 +35,16 @@ bottleneck --config ./other.toml           # alternate config
 ## Configuration
 
 Required. Every repo, its environments and its deploy-tag convention come from the config file;
-nothing is built in. It lives at the platform config dir
-(`~/Library/Application Support/bottleneck/config.toml` on macOS), or pass `--config`.
+nothing is built in. It is read from, in order:
+
+1. `--config <path>`
+2. `$XDG_CONFIG_HOME/bottleneck/config.toml` on macOS and Linux, falling back to
+   `~/.config/bottleneck/config.toml` — XDG on macOS too, alongside `gh`, `git` and `jj`, rather
+   than `~/Library/Application Support`
+3. `%APPDATA%\bottleneck\config\config.toml` on Windows
+
+The SQLite cache is separate and stays in the platform data dir (`~/Library/Application Support/
+bottleneck/` on macOS, `~/.local/share/bottleneck/` on Linux).
 [`config.example.toml`](config.example.toml) is the `pagos-ai/pagos` setup and documents each field.
 
 ```toml
@@ -118,7 +126,7 @@ The Pipeline tab flags any environment whose coverage is below 90%. `prod` is 10
 ## Development
 
 ```sh
-cargo test    # 88 tests, no network required
+cargo test    # 91 tests, no network required
 ```
 
 Rendering is covered headlessly at six terminal sizes down to 8x3. Deploy attribution has fixtures

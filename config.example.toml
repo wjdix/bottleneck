@@ -1,7 +1,7 @@
 # bottleneck configuration.
 #
-# Copy to the platform config dir (~/Library/Application Support/bottleneck/config.toml on macOS),
-# or pass --config <path>.
+# Copy to ~/.config/bottleneck/config.toml ($XDG_CONFIG_HOME/bottleneck/ if set; on Windows
+# %APPDATA%\bottleneck\config\config.toml), or pass --config <path>.
 
 # How much history to load on first sync.
 window_days = 90
