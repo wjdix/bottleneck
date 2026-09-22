@@ -114,7 +114,15 @@ impl Snapshot {
             env_tags.insert(env, EnvTags::new(placed));
         }
 
-        let envs: Vec<String> = env_tags.keys().cloned().collect();
+        // Configured display order, not the map's alphabetical one: the UI opens on `envs[0]`, and
+        // alphabetical puts `dev` first. Envs with tags but absent from the config go last.
+        let mut envs: Vec<String> = cfg
+            .envs
+            .iter()
+            .filter(|e| env_tags.contains_key(*e))
+            .cloned()
+            .collect();
+        envs.extend(env_tags.keys().filter(|e| !cfg.envs.contains(e)).cloned());
         let metrics: Vec<PrMetrics> = prs
             .iter()
             .map(|pr| PrMetrics::compute(pr, &repo.default_branch, &trunk, &env_tags))
@@ -274,5 +282,16 @@ pub mod fixtures {
             prs,
             ts("2026-08-26T15:00:00Z"),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The UI defaults to `envs[0]`, so this order decides what everyone sees first. Tags arrive
+    /// keyed alphabetically, which would put `dev` — the env with the least trustworthy numbers —
+    /// ahead of `prod`.
+    #[test]
+    fn envs_follow_configured_display_order() {
+        assert_eq!(super::fixtures::snapshot().envs, vec!["prod", "dev"]);
     }
 }

@@ -114,7 +114,7 @@ fn pipeline(f: &mut Frame, area: Rect, app: &App) {
     let usable_tags = snap.env_tags.get(&app.env).map(|t| t.len()).unwrap_or(0);
     f.render_widget(
         stat_card(
-            &format!("merge to {} deploy ({usable_tags} usable tags)", app.env),
+            &format!("merge to {} deploy ({usable_tags} tags)", app.env),
             agg.merge_to_deploy.get(&app.env).copied(),
         ),
         deploy_cols[0],
