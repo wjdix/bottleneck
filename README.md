@@ -4,7 +4,7 @@ A terminal UI that answers three questions about a GitHub repository:
 
 1. **How long do PRs wait for review, and for deploy?**
 2. **How many threads of work is each person carrying?**
-3. **How long from opening a PR to it being deployed?**
+3. **How long from opening a PR — and from it being ready for review — to it being deployed?**
 
 It loads from a local SQLite cache at launch and only touches the network when you press `r`.
 
@@ -89,6 +89,9 @@ The Pipeline tab flags any environment whose coverage is below 90%. `prod` is 10
 
 - Review latency is measured from the **last** ready-for-review event. `publishedAt` equals
   `createdAt` even for a PR that sat as a draft for hours, and PRs do cycle draft→ready→draft.
+- Ready-to-deploy runs from that same last ready-for-review event to the first deploy containing
+  the PR, per env — so ready-to-prod is the wait once a change asked for attention, with draft time
+  excluded. Production is `release/prod/<timestamp>`.
 - Open drafts have no ready time and are excluded from review stats — 48 of 85 open PRs here are
   drafts.
 - Bot reviews don't count as review. `coderabbitai` reviews nearly every PR within minutes.
@@ -102,7 +105,7 @@ The Pipeline tab flags any environment whose coverage is below 90%. `prod` is 10
 ## Development
 
 ```sh
-cargo test    # 74 tests, no network required
+cargo test    # 77 tests, no network required
 ```
 
 Rendering is covered headlessly at six terminal sizes down to 8x3. Deploy attribution has fixtures

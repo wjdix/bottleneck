@@ -325,6 +325,15 @@ fn dump_deploys(snap: &Snapshot) {
                 ),
                 None => print!("  merge->deploy no data"),
             }
+            match snap.aggregates.ready_to_deploy.get(env) {
+                Some(s) => print!(
+                    "  |  ready->deploy median {:>9} p75 {:>9} (n={})",
+                    format_duration(s.median),
+                    format_duration(s.p75),
+                    s.n
+                ),
+                None => print!("  |  ready->deploy no data"),
+            }
             match snap.aggregates.open_to_deploy.get(env) {
                 Some(s) => print!(
                     "  |  open->deploy median {:>9} p75 {:>9} (n={})",

@@ -110,7 +110,7 @@ fn pipeline(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(stat_card(title, s), stage_cols[i]);
     }
 
-    let deploy_cols = Layout::horizontal([Constraint::Ratio(1, 2); 2]).split(rows[1]);
+    let deploy_cols = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(rows[1]);
     let usable_tags = snap.env_tags.get(&app.env).map(|t| t.len()).unwrap_or(0);
     f.render_widget(
         stat_card(
@@ -121,10 +121,17 @@ fn pipeline(f: &mut Frame, area: Rect, app: &App) {
     );
     f.render_widget(
         stat_card(
+            &format!("ready to {} deploy", app.env),
+            agg.ready_to_deploy.get(&app.env).copied(),
+        ),
+        deploy_cols[1],
+    );
+    f.render_widget(
+        stat_card(
             &format!("open to {} deploy", app.env),
             agg.open_to_deploy.get(&app.env).copied(),
         ),
-        deploy_cols[1],
+        deploy_cols[2],
     );
 
     // The caveat travels with the number rather than living in a doc comment.
@@ -406,6 +413,10 @@ fn prs(f: &mut Frame, area: Rect, app: &App) {
                     Some(d) => Span::styled(format_duration(d), duration_style(d)),
                     None => Span::styled("-", DIM),
                 }),
+                Cell::from(match m.ready_to_deploy.get(&app.env) {
+                    Some(d) => Span::styled(format_duration(*d), duration_style(*d)),
+                    None => deploy_span(deploy),
+                }),
                 Cell::from(match m.open_to_deploy.get(&app.env) {
                     Some(d) => Span::styled(format_duration(*d), duration_style(*d)),
                     None => deploy_span(deploy),
@@ -419,13 +430,14 @@ fn prs(f: &mut Frame, area: Rect, app: &App) {
         area,
         app,
         rows,
-        vec!["PR", "title", "author", "state", "1st review", "open→deploy"],
+        vec!["PR", "title", "author", "state", "1st review", "ready→deploy", "open→deploy"],
         vec![
             Constraint::Length(7),
             Constraint::Min(20),
             Constraint::Length(15),
             Constraint::Length(8),
             Constraint::Length(11),
+            Constraint::Length(13),
             Constraint::Length(12),
         ],
         &format!(
@@ -596,17 +608,25 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
     lines.push(stage("review turnaround", m.review_turnaround));
     lines.push(stage("ready to merge", m.time_to_merge));
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("  deploys", HEADER)));
+    lines.push(Line::from(vec![
+        Span::styled("  deploys ", HEADER),
+        Span::styled("  from merge  from ready", DIM),
+    ]));
 
+    let since = |d: Option<&chrono::Duration>| {
+        d.map(|d| format!("{:<12}", format_duration(*d)))
+            .unwrap_or_else(|| format!("{:<12}", "-"))
+    };
     for (env, state) in &m.deploys {
         let detail = match state {
             DeployState::Deployed { tag, at } => Line::from(vec![
                 Span::styled(format!("  {env:<8}"), DIM),
                 Span::styled(
-                    m.merge_to_deploy
-                        .get(env)
-                        .map(|d| format!("{:<10}", format_duration(*d)))
-                        .unwrap_or_else(|| "-         ".into()),
+                    format!(
+                        "{}{}",
+                        since(m.merge_to_deploy.get(env)),
+                        since(m.ready_to_deploy.get(env))
+                    ),
                     Style::default().fg(Color::Green),
                 ),
                 Span::styled(format!("{tag}  {}", at.format("%Y-%m-%d %H:%M")), DIM),

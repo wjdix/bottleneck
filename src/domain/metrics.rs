@@ -21,6 +21,9 @@ pub struct PrMetrics {
     pub time_to_merge: Option<Duration>,
     /// Per-env: merge until the deploy that shipped it.
     pub merge_to_deploy: BTreeMap<String, Duration>,
+    /// Per-env: ready-for-review until the deploy that shipped it. Open-to-deploy minus draft
+    /// dwell, i.e. how long the change waited once it asked for anyone's attention.
+    pub ready_to_deploy: BTreeMap<String, Duration>,
     /// Per-env: PR opened until the deploy that shipped it. The end-to-end number.
     pub open_to_deploy: BTreeMap<String, Duration>,
     /// Per-env deploy outcome, including the states that have no duration.
@@ -61,6 +64,7 @@ impl PrMetrics {
 
         let mut deploys = BTreeMap::new();
         let mut merge_to_deploy = BTreeMap::new();
+        let mut ready_to_deploy = BTreeMap::new();
         let mut open_to_deploy = BTreeMap::new();
 
         for (env, tags) in env_tags {
@@ -75,6 +79,9 @@ impl PrMetrics {
                 if let Some(merged) = pr.merged_at {
                     merge_to_deploy.insert(env.clone(), elapsed(merged, *at));
                 }
+                if let Some(ready) = pr.ready_at {
+                    ready_to_deploy.insert(env.clone(), elapsed(ready, *at));
+                }
                 open_to_deploy.insert(env.clone(), elapsed(pr.created_at, *at));
             }
             deploys.insert(env.clone(), state);
@@ -86,6 +93,7 @@ impl PrMetrics {
             review_turnaround,
             time_to_merge,
             merge_to_deploy,
+            ready_to_deploy,
             open_to_deploy,
             deploys,
         }
@@ -264,6 +272,7 @@ pub struct Aggregates {
     /// Keyed by env. Envs are independent — a change can reach `dev` and `prod` without ever
     /// touching `qa` — so these are separate samples, not stages of one pipeline.
     pub merge_to_deploy: BTreeMap<String, Summary>,
+    pub ready_to_deploy: BTreeMap<String, Summary>,
     pub open_to_deploy: BTreeMap<String, Summary>,
     /// Merged PRs with no deploy tag containing them yet, per env.
     pub not_yet_deployed: BTreeMap<String, usize>,
@@ -277,6 +286,7 @@ pub fn aggregate(metrics: &[PrMetrics], envs: &[String]) -> Aggregates {
     };
 
     let mut merge_to_deploy = BTreeMap::new();
+    let mut ready_to_deploy = BTreeMap::new();
     let mut open_to_deploy = BTreeMap::new();
     let mut not_yet_deployed = BTreeMap::new();
 
@@ -287,6 +297,13 @@ pub fn aggregate(metrics: &[PrMetrics], envs: &[String]) -> Aggregates {
             .collect();
         if let Some(s) = Summary::of(m) {
             merge_to_deploy.insert(env.clone(), s);
+        }
+        let r: Vec<Duration> = metrics
+            .iter()
+            .filter_map(|x| x.ready_to_deploy.get(env).copied())
+            .collect();
+        if let Some(s) = Summary::of(r) {
+            ready_to_deploy.insert(env.clone(), s);
         }
         let o: Vec<Duration> = metrics
             .iter()
@@ -314,6 +331,7 @@ pub fn aggregate(metrics: &[PrMetrics], envs: &[String]) -> Aggregates {
         time_to_merge: collect(|m| m.time_to_merge),
         draft_dwell: collect(|m| m.draft_dwell),
         merge_to_deploy,
+        ready_to_deploy,
         open_to_deploy,
         not_yet_deployed,
         stacked,
@@ -390,6 +408,75 @@ mod tests {
         assert_eq!(format_duration(Duration::days(3) + Duration::hours(4)), "3d 4h");
         assert_eq!(format_duration(Duration::zero()), "0s");
         assert_eq!(format_duration(-mins(5)), "0s");
+    }
+
+    fn t(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// A PR opened as a draft at 09:00, ready at 12:00, merged at 13:00 as commit `m`.
+    fn drafted_pr(is_draft: bool) -> PullRequest {
+        PullRequest {
+            number: 1,
+            title: "t".into(),
+            author: "a".into(),
+            state: PrState::Merged,
+            is_draft,
+            base_ref: "main".into(),
+            head_ref: "b".into(),
+            created_at: t("2026-08-26T09:00:00Z"),
+            updated_at: t("2026-08-26T13:00:00Z"),
+            ready_at: (!is_draft).then(|| t("2026-08-26T12:00:00Z")),
+            merged_at: Some(t("2026-08-26T13:00:00Z")),
+            closed_at: Some(t("2026-08-26T13:00:00Z")),
+            merge_commit_oid: Some("m".into()),
+            first_review_at: None,
+            approved_at: None,
+            first_review_requested_at: None,
+            reviews: vec![],
+            labels: vec![],
+            additions: 0,
+            deletions: 0,
+            changed_files: 0,
+            truncated: false,
+        }
+    }
+
+    /// Trunk `head <- m`, with a prod deploy of `head` at 15:00.
+    fn prod_deploy_at_1500(pr: &PullRequest) -> PrMetrics {
+        let parents: crate::domain::trunk::ParentMap = [
+            ("head".to_string(), Some("m".to_string())),
+            ("m".to_string(), None),
+        ]
+        .into_iter()
+        .collect();
+        let trunk = Trunk::build("head", &parents);
+        let tags = EnvTags::new(vec![crate::domain::trunk::TrunkTag {
+            name: "release/prod/20260826_150000".into(),
+            idx: 0,
+            deployed_at: t("2026-08-26T15:00:00Z"),
+        }]);
+        let env_tags = BTreeMap::from([("prod".to_string(), tags)]);
+        PrMetrics::compute(pr, "main", &trunk, &env_tags)
+    }
+
+    #[test]
+    fn ready_to_deploy_excludes_draft_time() {
+        let m = prod_deploy_at_1500(&drafted_pr(false));
+        assert_eq!(m.ready_to_deploy["prod"], Duration::hours(3));
+    }
+
+    #[test]
+    fn ready_to_deploy_is_absent_without_a_ready_time() {
+        let m = prod_deploy_at_1500(&drafted_pr(true));
+        assert!(!m.ready_to_deploy.contains_key("prod"));
+    }
+
+    #[test]
+    fn ready_to_deploy_is_aggregated_per_env() {
+        let m = prod_deploy_at_1500(&drafted_pr(false));
+        let agg = aggregate(&[m], &["prod".to_string()]);
+        assert_eq!(agg.ready_to_deploy["prod"].median, Duration::hours(3));
     }
 
     #[test]
