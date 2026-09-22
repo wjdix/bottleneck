@@ -757,7 +757,7 @@ mod tests {
     }
 
     fn app_with_data() -> App {
-        App::new(Config::default(), vec![Some(fixtures::snapshot())])
+        App::new(Config::example(), vec![Some(fixtures::snapshot())])
     }
 
     #[test]
@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn empty_state_tells_the_user_to_refresh() {
-        let app = App::new(Config::default(), vec![None]);
+        let app = App::new(Config::example(), vec![None]);
         let out = render(&app, 80, 24);
         assert!(out.contains("No cached data"), "got:\n{out}");
         assert!(out.contains("Press r"), "got:\n{out}");

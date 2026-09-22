@@ -12,6 +12,7 @@ It loads from a local SQLite cache at launch and only touches the network when y
 
 ```sh
 cargo build --release
+cp config.example.toml ~/Library/Application\ Support/bottleneck/config.toml   # then edit
 
 ./target/release/bottleneck --sync     # first fetch (~70s for ~1000 PRs)
 ./target/release/bottleneck            # launch the TUI (instant, reads the cache)
@@ -33,24 +34,36 @@ bottleneck --config ./other.toml           # alternate config
 
 ## Configuration
 
-Optional; defaults target `pagos-ai/pagos`. Lives at the platform config dir
+Required. Every repo, its environments and its deploy-tag convention come from the config file;
+nothing is built in. It lives at the platform config dir
 (`~/Library/Application Support/bottleneck/config.toml` on macOS), or pass `--config`.
+[`config.example.toml`](config.example.toml) is the `pagos-ai/pagos` setup and documents each field.
 
 ```toml
 window_days = 90
-envs = ["prod", "qa", "dev"]
 bot_logins = ["coderabbitai", "dependabot", "github-actions", "renovate"]
-stale_review_hours = 24
 
 [[repos]]
 owner = "pagos-ai"
 name = "pagos"
 default_branch = "main"
+envs = ["prod", "qa", "dev"]          # display order; the UI opens on the first
+
+[repos.deploy_tags]
+pattern = "release/{env}/{timestamp}"  # {env} must come before {timestamp}
+timestamp_format = "%Y%m%d_%H%M%S"     # strftime, UTC, matched exactly
 ```
+
+Each env's tags are fetched by the pattern's literal prefix up to `{timestamp}` (`release/prod/`).
+Extra path segments before the timestamp (`release/dev/docker/<ts>`) are kept as a component and
+still count for that env; a component *ahead* of the env (`release/alerts-mlade-images/qa/<ts>`)
+does not match `qa`. Unknown keys are rejected, so a typo fails at startup instead of being ignored.
+Add more `[[repos]]` blocks to watch several repositories; `R` switches between them.
 
 ## How deploy attribution works
 
-Deploy tags look like `release/<env>/<timestamp>`. Mapping a PR to the deploy that shipped it has
+Deploy tags follow each repo's configured pattern — `release/<env>/<timestamp>` for
+`pagos-ai/pagos`. Mapping a PR to the deploy that shipped it has
 three parts that are each easy to get subtly wrong, so they are worth stating.
 
 **Position comes from the first-parent trunk, not commit dates.** `pagos-ai/pagos` reaches 14,359
@@ -105,7 +118,7 @@ The Pipeline tab flags any environment whose coverage is below 90%. `prod` is 10
 ## Development
 
 ```sh
-cargo test    # 77 tests, no network required
+cargo test    # 88 tests, no network required
 ```
 
 Rendering is covered headlessly at six terminal sizes down to 8x3. Deploy attribution has fixtures

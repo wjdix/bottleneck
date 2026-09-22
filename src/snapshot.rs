@@ -28,7 +28,7 @@ pub struct Snapshot {
     /// Deploy tags per env, already placed on the trunk.
     pub env_tags: BTreeMap<String, EnvTags>,
     pub trunk: Trunk,
-    /// Tags found under `release/` whose names aren't parseable deploy timestamps.
+    /// Tags matching an env's fetch prefix whose names don't fit the repo's tag pattern.
     pub skipped_tags: Vec<String>,
     /// Per-env: how much of that env's deploy history this analysis can actually see.
     pub coverage: BTreeMap<String, EnvCoverage>,
@@ -92,7 +92,12 @@ impl Snapshot {
 
         let mut env_tags = BTreeMap::new();
         let mut coverage = BTreeMap::new();
-        for (env, tags) in tags_by_env {
+        // An env dropped from the config may still have tags in the cache. The config alone decides
+        // what is analysed and shown.
+        let configured = tags_by_env
+            .into_iter()
+            .filter(|(env, _)| repo.envs.contains(env));
+        for (env, tags) in configured {
             let mut placed = Vec::new();
             let mut cov = EnvCoverage::default();
             for tag in tags {
@@ -115,14 +120,13 @@ impl Snapshot {
         }
 
         // Configured display order, not the map's alphabetical one: the UI opens on `envs[0]`, and
-        // alphabetical puts `dev` first. Envs with tags but absent from the config go last.
-        let mut envs: Vec<String> = cfg
+        // alphabetical puts `dev` first.
+        let envs: Vec<String> = repo
             .envs
             .iter()
             .filter(|e| env_tags.contains_key(*e))
             .cloned()
             .collect();
-        envs.extend(env_tags.keys().filter(|e| !cfg.envs.contains(e)).cloned());
         let metrics: Vec<PrMetrics> = prs
             .iter()
             .map(|pr| PrMetrics::compute(pr, &repo.default_branch, &trunk, &env_tags))
@@ -175,7 +179,7 @@ impl Snapshot {
 #[cfg(test)]
 pub mod fixtures {
     use super::*;
-    use crate::domain::deploy::parse_tag;
+    use crate::domain::deploy::tests::release_pattern;
     use crate::domain::pr::{PrState, Review};
     use crate::github::fetch::Commit;
 
@@ -188,6 +192,8 @@ pub mod fixtures {
             owner: "pagos-ai".into(),
             name: "pagos".into(),
             default_branch: "main".into(),
+            envs: vec!["prod".into(), "qa".into(), "dev".into()],
+            tags: release_pattern(),
         }
     }
 
@@ -247,7 +253,7 @@ pub mod fixtures {
         let name = "release/prod/20260826_125800";
         tags.insert("prod".to_string(), vec![DeployTag {
             name: name.into(),
-            parsed: parse_tag(name).unwrap(),
+            parsed: release_pattern().parse("prod", name).unwrap(),
             commit_oid: "bbb".into(),
             commit_date: ts("2026-08-26T10:00:00Z"),
         }]);
@@ -255,7 +261,7 @@ pub mod fixtures {
         let dev = "release/dev/20260826_134906";
         tags.insert("dev".to_string(), vec![DeployTag {
             name: dev.into(),
-            parsed: parse_tag(dev).unwrap(),
+            parsed: release_pattern().parse("dev", dev).unwrap(),
             commit_oid: "not-on-trunk".into(),
             commit_date: ts("2026-08-26T13:30:00Z"),
         }]);
@@ -275,7 +281,7 @@ pub mod fixtures {
 
         Snapshot::build(
             &repo(),
-            &Config::default(),
+            &Config::example(),
             &history,
             tags,
             vec!["release/dev/parrot-test-20260605_161016".into()],

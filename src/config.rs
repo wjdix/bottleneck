@@ -1,44 +1,51 @@
-//! Configuration: which repos to watch, which envs matter, and what counts as a bot.
+//! Configuration: which repos to watch, how each one names its deploy tags, and what counts as a
+//! bot.
 //!
 //! Lives at the platform config dir (`~/Library/Application Support/bottleneck/config.toml` on
-//! macOS). A missing file is not an error — the defaults below target the repo we care about today,
-//! and the file is only needed to add more.
+//! macOS), or wherever `--config` points. There is no built-in repository: every repo, its envs and
+//! its tag convention come from the file, so a missing file is an error rather than a silent
+//! default. `config.example.toml` at the repo root is a working starting point.
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+use crate::domain::deploy::TagPattern;
+
+/// Unknown fields are rejected so a typo — or a top-level `envs` from before envs moved onto each
+/// repo — fails loudly instead of being ignored.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(default = "default_repos")]
     pub repos: Vec<RepoConfig>,
 
     /// How much history to load on first launch.
     #[serde(default = "default_window_days")]
     pub window_days: i64,
 
-    /// Environments surfaced in the UI, in display order. Envs are independent: a change may reach
-    /// `dev` and `prod` without ever touching `qa`, so this is a display list, not a pipeline.
-    #[serde(default = "default_envs")]
-    pub envs: Vec<String>,
-
     /// Accounts whose reviews don't count as human review. GraphQL `Bot` authors are excluded
     /// automatically; this covers bot-like `User` accounts that the API reports as people.
     #[serde(default = "default_bots")]
     pub bot_logins: Vec<String>,
-
-    /// An open PR with no human review after this many hours is flagged as stuck.
-    #[serde(default = "default_stale_hours")]
-    pub stale_review_hours: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoConfig {
     pub owner: String,
     pub name: String,
     /// Trunk branch used for deploy attribution.
     #[serde(default = "default_branch")]
     pub default_branch: String,
+    /// Environments to fetch deploy tags for, in display order; the UI opens on the first. Envs are
+    /// independent — a change may reach `dev` and `prod` without ever touching `qa` — so this is a
+    /// display list, not a pipeline.
+    #[serde(default)]
+    pub envs: Vec<String>,
+    /// How this repo names deploy tags. Written as a `[repos.deploy_tags]` table with `pattern` and
+    /// `timestamp_format`, validated at load.
+    #[serde(rename = "deploy_tags", deserialize_with = "tag_pattern")]
+    pub tags: TagPattern,
 }
 
 impl RepoConfig {
@@ -47,12 +54,15 @@ impl RepoConfig {
     }
 }
 
-fn default_repos() -> Vec<RepoConfig> {
-    vec![RepoConfig {
-        owner: "pagos-ai".to_string(),
-        name: "pagos".to_string(),
-        default_branch: default_branch(),
-    }]
+fn tag_pattern<'de, D: Deserializer<'de>>(d: D) -> Result<TagPattern, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Raw {
+        pattern: String,
+        timestamp_format: String,
+    }
+    let raw = Raw::deserialize(d)?;
+    TagPattern::new(&raw.pattern, &raw.timestamp_format).map_err(serde::de::Error::custom)
 }
 
 fn default_branch() -> String {
@@ -63,10 +73,6 @@ fn default_window_days() -> i64 {
     90
 }
 
-fn default_envs() -> Vec<String> {
-    ["prod", "qa", "dev"].iter().map(|s| s.to_string()).collect()
-}
-
 fn default_bots() -> Vec<String> {
     ["coderabbitai", "dependabot", "github-actions", "renovate"]
         .iter()
@@ -74,31 +80,22 @@ fn default_bots() -> Vec<String> {
         .collect()
 }
 
-fn default_stale_hours() -> i64 {
-    24
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            repos: default_repos(),
-            window_days: default_window_days(),
-            envs: default_envs(),
-            bot_logins: default_bots(),
-            stale_review_hours: default_stale_hours(),
-        }
-    }
-}
-
 impl Config {
-    /// Load from `path`, or fall back to defaults when the file doesn't exist.
+    /// Load and validate the config at `path`.
     pub fn load(path: &Path) -> Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(raw) => toml::from_str(&raw)
-                .with_context(|| format!("parsing config at {}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e).with_context(|| format!("reading config at {}", path.display())),
-        }
+        let raw = std::fs::read_to_string(path).with_context(|| {
+            format!(
+                "reading config at {} (copy config.example.toml there, or pass --config)",
+                path.display()
+            )
+        })?;
+        Self::parse(&raw).with_context(|| format!("parsing config at {}", path.display()))
+    }
+
+    fn parse(raw: &str) -> Result<Self> {
+        let cfg: Self = toml::from_str(raw)?;
+        anyhow::ensure!(!cfg.repos.is_empty(), "no [[repos]] configured");
+        Ok(cfg)
     }
 
     /// True if this login should be ignored when computing "first human review".
@@ -108,6 +105,12 @@ impl Config {
 
     pub fn window_start(&self) -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now() - chrono::Duration::days(self.window_days)
+    }
+
+    /// The shipped example config, which doubles as the test fixture so it can't rot.
+    #[cfg(test)]
+    pub fn example() -> Self {
+        Self::parse(include_str!("../config.example.toml")).expect("example config is valid")
     }
 }
 
@@ -132,31 +135,66 @@ pub fn db_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    const MINIMAL: &str = r#"
+        [[repos]]
+        owner = "acme"
+        name = "widgets"
+        envs = ["production"]
+        [repos.deploy_tags]
+        pattern = "deploy/{env}/{timestamp}"
+        timestamp_format = "%Y%m%d%H%M%S"
+    "#;
+
     #[test]
-    fn defaults_target_the_pagos_repo() {
-        let c = Config::default();
+    fn example_config_parses() {
+        let c = Config::example();
         assert_eq!(c.repos[0].slug(), "pagos-ai/pagos");
+        assert_eq!(c.repos[0].envs, ["prod", "qa", "dev"]);
+        assert_eq!(c.repos[0].tags.fetch_prefix("prod"), "release/prod/");
+    }
+
+    #[test]
+    fn missing_config_file_is_an_error_naming_the_path() {
+        let err = Config::load(Path::new("/nonexistent/bottleneck/config.toml")).unwrap_err();
+        assert!(format!("{err:#}").contains("/nonexistent/bottleneck/config.toml"));
+    }
+
+    #[test]
+    fn minimal_config_keeps_defaults_for_absent_fields() {
+        let c = Config::parse(MINIMAL).unwrap();
         assert_eq!(c.window_days, 90);
+        assert_eq!(c.repos[0].default_branch, "main");
+        assert_eq!(c.repos[0].tags.fetch_prefix("production"), "deploy/production/");
+        assert!(c.is_bot("CodeRabbitAI"), "bot list should default and be case-insensitive");
     }
 
     #[test]
-    fn missing_config_file_falls_back_to_defaults() {
-        let c = Config::load(Path::new("/nonexistent/bottleneck/config.toml")).unwrap();
-        assert_eq!(c.repos, Config::default().repos);
+    fn config_without_repos_is_rejected() {
+        assert!(Config::parse("window_days = 30").is_err());
+        assert!(Config::parse("repos = []").is_err());
     }
 
     #[test]
-    fn partial_config_keeps_defaults_for_absent_fields() {
+    fn repo_without_a_tag_convention_is_rejected() {
         let toml = r#"
-            window_days = 30
             [[repos]]
             owner = "acme"
             name = "widgets"
         "#;
-        let c: Config = toml::from_str(toml).unwrap();
-        assert_eq!(c.window_days, 30);
-        assert_eq!(c.repos[0].slug(), "acme/widgets");
-        assert_eq!(c.repos[0].default_branch, "main");
-        assert!(c.is_bot("CodeRabbitAI"), "bot list should default and be case-insensitive");
+        assert!(Config::parse(toml).is_err());
+    }
+
+    #[test]
+    fn invalid_tag_pattern_is_rejected_with_the_reason() {
+        let toml = MINIMAL.replace("deploy/{env}/{timestamp}", "deploy/{timestamp}");
+        let err = format!("{:#}", Config::parse(&toml).unwrap_err());
+        assert!(err.contains("{env}"), "got: {err}");
+    }
+
+    /// The pre-per-repo layout. Silently ignoring it would drop every env.
+    #[test]
+    fn top_level_envs_is_rejected() {
+        let toml = format!("envs = [\"prod\"]\n{MINIMAL}");
+        assert!(Config::parse(&toml).is_err());
     }
 }

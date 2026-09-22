@@ -84,13 +84,6 @@ async fn main() -> Result<()> {
         return dump_trunk(&cfg).await;
     }
 
-    if cfg.repos.is_empty() {
-        anyhow::bail!(
-            "no repositories configured. Add one to {}",
-            cfg_path.display()
-        );
-    }
-
     let db = config::db_path()?;
     let mut store = store::Store::open(&db)?;
 
@@ -209,7 +202,7 @@ async fn dump_tags(cfg: &Config) -> Result<()> {
 
     for repo in &cfg.repos {
         println!("=== {} (tags with commits since {}) ===", repo.slug(), since.date_naive());
-        for env in &cfg.envs {
+        for env in &repo.envs {
             let scan = fetch::fetch_tags(&gh, repo, env, since).await?;
             println!(
                 "  {env}: {} deploy tags, {} unparseable, {} without commit",

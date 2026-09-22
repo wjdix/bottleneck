@@ -71,7 +71,7 @@ pub async fn refresh(
 
     let mut tags_by_env = std::collections::BTreeMap::new();
     let mut skipped = Vec::new();
-    for env in &cfg.envs {
+    for env in &repo.envs {
         progress(&format!("tags: {env}"));
         let scan = crate::github::fetch::fetch_tags(gh, repo, env, window_start).await?;
         skipped.extend(scan.unparseable);

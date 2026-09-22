@@ -106,8 +106,8 @@ impl App {
             .flatten()
             .next()
             .and_then(|s| s.envs.first().cloned())
-            .or_else(|| cfg.envs.first().cloned())
-            .unwrap_or_else(|| "prod".to_string());
+            .or_else(|| cfg.repos.first().and_then(|r| r.envs.first().cloned()))
+            .unwrap_or_default();
         Self {
             cfg,
             snapshots,
@@ -276,7 +276,8 @@ impl App {
     pub fn envs(&self) -> Vec<String> {
         self.snapshot()
             .map(|s| s.envs.clone())
-            .unwrap_or_else(|| self.cfg.envs.clone())
+            .or_else(|| self.repo().map(|r| r.envs.clone()))
+            .unwrap_or_default()
     }
 
     pub fn cycle_env(&mut self) {
@@ -407,7 +408,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn app() -> App {
-        App::new(Config::default(), vec![None])
+        App::new(Config::example(), vec![None])
     }
 
     fn press(app: &mut App, code: KeyCode) -> Action {
@@ -525,12 +526,10 @@ mod tests {
     }
 
     fn two_repo_cfg() -> Config {
-        let mut cfg = Config::default();
-        cfg.repos.push(crate::config::RepoConfig {
-            owner: "pagos-ai".into(),
-            name: "other".into(),
-            default_branch: "main".into(),
-        });
+        let mut cfg = Config::example();
+        let mut other = cfg.repos[0].clone();
+        other.name = "other".into();
+        cfg.repos.push(other);
         cfg
     }
 

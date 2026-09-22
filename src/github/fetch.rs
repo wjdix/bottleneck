@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
 use crate::config::RepoConfig;
-use crate::domain::deploy::{ParsedTag, parse_tag};
+use crate::domain::deploy::ParsedTag;
 use crate::domain::trunk::ParentMap;
 use crate::github::{GitHub, model, queries};
 
@@ -39,7 +39,7 @@ pub struct TagScan {
     pub no_commit: Vec<String>,
 }
 
-/// Fetch deploy tags under `release/<env>/`, stopping once past `since`.
+/// Fetch `env`'s deploy tags by the repo's tag-pattern prefix, stopping once past `since`.
 ///
 /// Ordered by tag commit date descending, so the first page that falls entirely before the window
 /// ends the scan. Note this orders by *commit* date, which is also what deploy attribution uses.
@@ -49,7 +49,7 @@ pub async fn fetch_tags(
     env: &str,
     since: DateTime<Utc>,
 ) -> Result<TagScan> {
-    let prefix = format!("release/{env}/");
+    let prefix = repo.tags.fetch_prefix(env);
     let mut scan = TagScan::default();
     let mut cursor: Option<String> = None;
 
@@ -77,7 +77,7 @@ pub async fn fetch_tags(
                 reached_window_edge = true;
                 continue;
             }
-            match parse_tag(&node.name) {
+            match repo.tags.parse(env, &node.name) {
                 Some(parsed) => scan.tags.push(DeployTag {
                     name: node.name,
                     parsed,

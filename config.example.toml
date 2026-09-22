@@ -1,0 +1,30 @@
+# bottleneck configuration.
+#
+# Copy to the platform config dir (~/Library/Application Support/bottleneck/config.toml on macOS),
+# or pass --config <path>.
+
+# How much history to load on first sync.
+window_days = 90
+
+# Accounts whose reviews don't count as human review. GitHub `Bot` accounts are excluded anyway.
+bot_logins = ["coderabbitai", "dependabot", "github-actions", "renovate"]
+
+[[repos]]
+owner = "pagos-ai"
+name = "pagos"
+# Trunk used for deploy attribution. Defaults to "main".
+default_branch = "main"
+# Environments to fetch deploy tags for, in display order. The UI opens on the first.
+envs = ["prod", "qa", "dev"]
+
+# How deploy tags are named. `pattern` must contain {env} and then {timestamp}; each env's tags are
+# fetched by the literal prefix up to {timestamp} (here `release/prod/`). Extra path segments before
+# the timestamp, as in `release/dev/docker/20260324_114900`, are kept as a component and still
+# count for that env.
+#
+# `timestamp_format` is strftime, read as UTC, and must match exactly: `20251215_13235` is skipped
+# rather than read as 13:23:05. The timestamp should be when the deploy happened — it is used as
+# the deploy time, not the tagged commit's date.
+[repos.deploy_tags]
+pattern = "release/{env}/{timestamp}"
+timestamp_format = "%Y%m%d_%H%M%S"

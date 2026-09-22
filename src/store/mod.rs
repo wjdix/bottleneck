@@ -555,18 +555,13 @@ fn parse_state(s: &str) -> PrState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::deploy::parse_tag;
 
     fn t(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
     fn repo() -> RepoConfig {
-        RepoConfig {
-            owner: "pagos-ai".into(),
-            name: "pagos".into(),
-            default_branch: "main".into(),
-        }
+        crate::snapshot::fixtures::repo()
     }
 
     fn sample_pr() -> PullRequest {
@@ -635,7 +630,9 @@ mod tests {
             "prod".to_string(),
             vec![DeployTag {
                 name: name.into(),
-                parsed: parse_tag(name).unwrap(),
+                parsed: crate::domain::deploy::tests::release_pattern()
+                    .parse("prod", name)
+                    .unwrap(),
                 commit_oid: "b2fba4ae".into(),
                 commit_date: t("2026-08-26T12:55:05Z"),
             }],
@@ -696,7 +693,7 @@ mod tests {
 
         let mut store = Store::open_in_memory().unwrap();
         let repo = repo();
-        let cfg = Config::default();
+        let cfg = Config::example();
         store
             .save(&repo, &[sample_pr()], &sample_history(), &sample_tags(), Utc::now())
             .unwrap();
